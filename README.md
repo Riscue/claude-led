@@ -103,7 +103,7 @@ and update the paths to point to your `led_driver.py` location.
 > launching Claude Code:
 >
 > ```bash
-> export CLAUDE_LED_PROJECT_FOLDER=/absolute/path/to/led-status
+> export CLAUDE_LED_PROJECT_FOLDER=/absolute/path/to/claude-led
 > ```
 >
 > Alternatively, replace every `$CLAUDE_LED_PROJECT_FOLDER` occurrence in the hook
