@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Claude Code LED Status Driver (Mac side)
+Claude Code LED Status Driver
 -----------------------------------------
 Invoked by Claude Code hooks and sends a single-line state command to the
 ESP8266 over USB-serial (idle / thinking / tool / waiting / success / error).

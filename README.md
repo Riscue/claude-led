@@ -6,7 +6,7 @@ Claude Code (idle / thinking / running a tool / waiting for input / success / er
 ## Architecture
 
 ```
-Mac (Claude Code) --hooks--> led_driver.py --USB-serial--> Wemos D1 Mini --WS2812B data line--> WS2812B strip
+Claude Code --hooks--> led_driver.py --USB-serial--> Wemos D1 Mini --WS2812B data line--> WS2812B strip
 ```
 
 - **No Wi-Fi.** The D1 Mini's wireless feature is never used — USB-serial only.
@@ -29,7 +29,7 @@ Mac (Claude Code) --hooks--> led_driver.py --USB-serial--> Wemos D1 Mini --WS281
 
 - `firmware/platformio.ini` — PlatformIO configuration (board + library versions pinned)
 - `firmware/src/main.cpp` — Firmware flashed onto the D1 Mini
-- `driver/led_driver.py` — Python script running on the Mac, invoked by hooks
+- `driver/led_driver.py` — Python script running on the host, invoked by hooks
 - `driver/claude_settings_hooks_example.json` — Example Claude Code hook configuration
 
 ## Setup sequence
@@ -45,7 +45,7 @@ but always confirm your strip's own color coding.
 ### 2) Flashing the firmware (PlatformIO)
 
 - If PlatformIO is not installed: `pip3 install platformio` (or `brew install platformio`)
-- Plug the D1 Mini into the Mac via USB
+- Plug the D1 Mini in via USB
 - From the project root: `cd firmware && pio run -t upload`
     - Dependencies (`espressif8266@4.2.1` platform, `Adafruit NeoPixel@1.15.5` library)
       are downloaded automatically; versions are pinned in `platformio.ini`.
@@ -61,7 +61,7 @@ D1 Mini "G"   -> Strip GND
 D1 Mini "D4"  -> Strip DIN (data)
 ```
 
-### 4) Mac-side driver
+### 4) Host-side driver
 
 ```bash
 pip3 install pyserial

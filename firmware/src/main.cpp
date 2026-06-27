@@ -1,7 +1,7 @@
 /*
  * Claude Code Status Indicator - Wemos D1 Mini (ESP8266) + WS2812B
  * ---------------------------------------------------------------------------
- * Receives single-line commands over USB-serial from the Mac and displays the
+ * Receives single-line commands over USB-serial and displays the
  * color/animation matching that state on the LED strip.
  *
  * Hardware: Wemos D1 Mini (ESP8266, CH340/CP2104 USB-serial chip)
