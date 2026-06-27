@@ -11,7 +11,7 @@ Claude Code --hooks--> led_driver.py --USB-serial--> Wemos D1 Mini --WS2812B dat
 
 - **No Wi-Fi.** The D1 Mini's wireless feature is never used — USB-serial only.
 - **Single cable.** Power and data both go through the same USB cable; no external power supply needed.
-- Brightness is kept intentionally low in firmware (for USB port safety).
+- Brightness is capped in firmware (USB port safety); each command can additionally dim below that ceiling via a `bright_pct` parameter.
 
 ## Hardware requirements
 
@@ -68,6 +68,13 @@ pip3 install pyserial
 python3 driver/led_driver.py idle   # test — LEDs should slowly breathe blue
 ```
 
+For ad-hoc testing without involving the state mapping:
+
+```bash
+python3 driver/led_driver.py --raw breathe --rgb 0,50,220 --period 3500
+python3 driver/led_driver.py --raw solid --rgb 0,0,255 --brightness 30
+```
+
 ### 5) Wiring up Claude Code hooks
 
 Append the contents of `claude_settings_hooks_example.json` to `~/.claude/settings.json`,
@@ -75,15 +82,57 @@ and update the paths to point to your `led_driver.py` location.
 
 ## State colors
 
-| Command    | State               | Visual                                   |
-|------------|---------------------|------------------------------------------|
-| `idle`     | Idle                | Slow blue-gray breathe                   |
-| `thinking` | Model is responding | Purple scanner dot                       |
-| `tool`     | Tool is running     | Yellow/orange pulse                      |
-| `waiting`  | Waiting for input   | Slow white pulse                         |
-| `success`  | Task completed      | Green fill animation (loops, persistent) |
-| `error`    | Error occurred      | Hard red blink (persistent)              |
-| `off`      | Off                 | All LEDs off                             |
+The driver maps each Claude Code state to an animation via `STATE_MAP` in
+`driver/led_driver.py`. Defaults:
+
+| State      | Animation | Color (RGB)  | Period | Brightness |
+|------------|-----------|--------------|--------|------------|
+| `idle`     | breathe   | 0, 50, 220   | 3500ms | 100%       |
+| `thinking` | scanner   | 90, 0, 170   | 1600ms | 100%       |
+| `tool`     | breathe   | 255, 128, 0  | 900ms  | 100%       |
+| `waiting`  | breathe   | 200, 200, 200 | 2500ms | 60%        |
+| `success`  | fill      | 0, 220, 0    | 1600ms | 100%       |
+| `error`    | blink     | 180, 0, 0    | 300ms  | 100%       |
+| `off`      | off       | —            | —      | —          |
+
+## Wire protocol
+
+The firmware is generic — it does not know about Claude Code, only the
+animation commands below. Each is a single ASCII line, lowercase, newline-
+terminated, at 115200 baud. `bright_pct` is optional (default 100) and scales
+below the firmware's `MAX_BRIGHTNESS` USB-safety ceiling.
+
+```
+solid   r g b [bright_pct]              all LEDs steady
+breathe r g b period_ms [bright_pct]    black -> color, sin-based pulse
+blink   r g b period_ms [bright_pct]    period/2 on + period/2 off
+scanner r g b period_ms [bright_pct]    dot sweeps back and forth
+fill    r g b period_ms [bright_pct]    LEDs light one-by-one, then hold
+off
+```
+
+RGB is decimal 0-255 per channel. Period is in milliseconds (clamped to >= 50
+in firmware). Unknown animations and malformed lines are silently ignored.
+
+## Customizing the visuals
+
+Edit `STATE_MAP` in `driver/led_driver.py` to retune any state's animation,
+color, period, or brightness — **no firmware reflash required**. Each entry is
+a 4-tuple: `(animation, (r, g, b), period_ms, brightness_pct)`.
+
+```python
+# Dim the error blink to 70% and slow it down:
+"error": ("blink", (180, 0, 0), 500, 70),
+
+# Make idle a calm green instead of blue:
+"idle": ("breathe", (0, 180, 80), 4000, 80),
+```
+
+For one-off testing from the shell, bypass `STATE_MAP` with `--raw`:
+
+```bash
+python3 driver/led_driver.py --raw scanner --rgb 200,0,255 --period 1200 --brightness 50
+```
 
 ## Claude Code hooks → state mapping
 

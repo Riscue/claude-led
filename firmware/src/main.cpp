@@ -1,8 +1,25 @@
 /*
- * Claude Code Status Indicator - Wemos D1 Mini (ESP8266) + WS2812B
+ * WS2812B Animation Driver - Wemos D1 Mini (ESP8266)
  * ---------------------------------------------------------------------------
- * Receives single-line commands over USB-serial and displays the
- * color/animation matching that state on the LED strip.
+ * Receives single-line commands over USB-serial and renders the requested
+ * animation. The firmware is stateless regarding any upstream application
+ * (it knows nothing about Claude Code, hooks, or "states"): it only knows
+ * the animation name + color + speed + brightness. The host-side driver
+ * owns any higher-level mapping.
+ *
+ * Wire protocol (one ASCII line per command, 115200 baud, newline-terminated):
+ *   solid   r g b [bright_pct]
+ *   breathe r g b period_ms [bright_pct]   black -> color, sin, period = full cycle
+ *   blink   r g b period_ms [bright_pct]   period/2 on + period/2 off
+ *   scanner r g b period_ms [bright_pct]   dot sweeps back and forth
+ *   fill    r g b period_ms [bright_pct]   LEDs light one-by-one, hold when all lit
+ *   off
+ *
+ *   bright_pct: 0-100 (optional, default 100). Scales below MAX_BRIGHTNESS.
+ *
+ * Unknown animation names or malformed parameter counts are silently ignored
+ * (the previous animation continues). RGB is clamped to 0-255, period to
+ * >= MIN_PERIOD_MS, bright_pct to 0-100.
  *
  * Hardware: Wemos D1 Mini (ESP8266, CH340/CP2104 USB-serial chip)
  * Library:  Adafruit NeoPixel@1.15.5 (NOT FastLED -- FastLED has known timing
@@ -14,9 +31,9 @@
  * POWER NOTE: There is no extra power cable -- a single USB cable carries both
  * power and data. 8 LEDs at full white can draw ~500mA; USB port limits range
  * from 500mA (USB 2.0) to 900mA (USB-C). MAX_BRIGHTNESS=32 (about 12% duty)
- * keeps the peak current well within USB 2.0 limits. Do NOT raise this limit
- * without an external power supply -- it is what guarantees single-cable /
- * no-external-power operation.
+ * keeps the peak current well within USB 2.0 limits. bright_pct only scales
+ * BELOW this ceiling -- it can never exceed it. Do NOT raise MAX_BRIGHTNESS
+ * without an external power supply.
  *
  * Wiring (from the strip's 3-pin input connector or pads):
  *   D1 Mini "5V" pin  -> Strip 5V   (raw 5V from USB; when the D1 Mini is
@@ -33,112 +50,156 @@
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 
-#define DATA_PIN       2      // D4 = GPIO2 (Wemos D1 Mini silkscreen "D4")
+#define DATA_PIN        2      // D4 = GPIO2 (Wemos D1 Mini silkscreen "D4")
 // Note: D4 is a boot-strapping pin + onboard blue LED. After boot it can be
 // used as WS2812B data. We keep it here because the cable is already soldered
 // to this pin; for a fresh build prefer D2 (GPIO4).
-#define NUM_LEDS       8      // WS2812B strip
-#define MAX_BRIGHTNESS 32     // 0-255, USB-safe upper bound (see POWER NOTE above)
-#define SERIAL_BAUD    115200
+#define NUM_LEDS        8      // WS2812B strip
+#define MAX_BRIGHTNESS  32     // 0-255, USB-safe upper bound (see POWER NOTE)
+#define SERIAL_BAUD     115200
+#define MIN_PERIOD_MS   50     // sub-50ms periods look broken at our 16ms loop cadence
 
 Adafruit_NeoPixel strip(NUM_LEDS, DATA_PIN, NEO_GRB + NEO_KHZ800);
 
-// ---- State definitions ----
-enum ClaudeState {
-  STATE_IDLE,
-  STATE_THINKING,
-  STATE_TOOL_RUNNING,
-  STATE_WAITING_INPUT,
-  STATE_SUCCESS,
-  STATE_ERROR,
-  STATE_OFF
+enum Animation {
+  ANIM_SOLID,
+  ANIM_BREATHE,
+  ANIM_BLINK,
+  ANIM_SCANNER,
+  ANIM_FILL,
+  ANIM_OFF
 };
 
-ClaudeState currentState = STATE_OFF;  // start dark on boot, state changes once a command arrives
-unsigned long stateChangedAt = 0;
+struct AnimState {
+  Animation anim = ANIM_OFF;
+  uint8_t  r = 0, g = 0, b = 0;
+  uint16_t period = 0;
+  uint8_t  brightPct = 100;     // 0-100, scales below MAX_BRIGHTNESS
+  unsigned long startedAt = 0;
+} current;
 
-// ---- Helper: 8-bit sine-based "breathe" effect (replaces FastLED's beatsin8) ----
-uint8_t breathe(uint16_t periodMs, uint8_t minVal, uint8_t maxVal) {
-  float phase = (millis() % periodMs) / (float)periodMs;       // 0.0 - 1.0
-  float s = (sin(phase * 2.0 * PI) + 1.0) / 2.0;                // 0.0 - 1.0
-  return minVal + (uint8_t)(s * (maxVal - minVal));
-}
+uint8_t clamp8(int v)   { return v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v); }
+uint8_t clampPct(int v) { return v < 0 ? 0 : (v > 100 ? 100 : (uint8_t)v); }
 
-void setState(ClaudeState s) {
-  currentState = s;
-  stateChangedAt = millis();
+void applyAnimation(Animation a, uint8_t r, uint8_t g, uint8_t b,
+                    uint16_t period, uint8_t pct) {
+  current.anim = a;
+  current.r = r;
+  current.g = g;
+  current.b = b;
+  current.period = period;
+  current.brightPct = pct;
+  current.startedAt = millis();
+  // MAX_BRIGHTNESS is the USB-safe ceiling; bright_pct scales within it.
+  strip.setBrightness((uint8_t)((uint16_t)MAX_BRIGHTNESS * pct / 100));
 }
 
 void handleCommand(String cmd) {
   cmd.trim();
   cmd.toLowerCase();
+  if (cmd.length() == 0) return;
 
-  if (cmd == "idle")           setState(STATE_IDLE);
-  else if (cmd == "thinking")  setState(STATE_THINKING);
-  else if (cmd == "tool")      setState(STATE_TOOL_RUNNING);
-  else if (cmd == "waiting")   setState(STATE_WAITING_INPUT);
-  else if (cmd == "success")   setState(STATE_SUCCESS);
-  else if (cmd == "error")     setState(STATE_ERROR);
-  else if (cmd == "off")       setState(STATE_OFF);
-  // Unknown commands are silently ignored
+  int sp = cmd.indexOf(' ');
+  String name = (sp < 0) ? cmd : cmd.substring(0, sp);
+  String rest = (sp < 0) ? String("") : cmd.substring(sp + 1);
+  rest.trim();
+
+  if (name == "off") {
+    applyAnimation(ANIM_OFF, 0, 0, 0, 0, 0);
+    return;
+  }
+
+  if (name == "solid") {
+    int r, g, b, pct = 100;
+    int n = sscanf(rest.c_str(), "%d %d %d %d", &r, &g, &b, &pct);
+    if (n >= 3) {
+      applyAnimation(ANIM_SOLID, clamp8(r), clamp8(g), clamp8(b), 0, clampPct(pct));
+    }
+    return;
+  }
+
+  if (name == "breathe" || name == "blink" || name == "scanner" || name == "fill") {
+    int r, g, b, period, pct = 100;
+    int n = sscanf(rest.c_str(), "%d %d %d %d %d", &r, &g, &b, &period, &pct);
+    if (n >= 4 && period >= MIN_PERIOD_MS) {
+      Animation a = (name == "breathe") ? ANIM_BREATHE
+                  : (name == "blink")   ? ANIM_BLINK
+                  : (name == "scanner") ? ANIM_SCANNER
+                                        : ANIM_FILL;
+      applyAnimation(a, clamp8(r), clamp8(g), clamp8(b),
+                     (uint16_t)period, clampPct(pct));
+    }
+    return;
+  }
+  // Unknown command: silently ignored.
 }
 
-void renderIdle() {
-  // Slow blue breathe. The 40-220 range produces a clearly visible pulse
-  // at MAX_BRIGHTNESS=32.
-  uint8_t b = breathe(3500, 40, 220);
-  uint32_t c = strip.Color(0, b / 5, b); // R=0, a little green, blue dominant
+// ---- Render functions (read from `current`, brightness already applied via setBrightness) ----
+
+void renderSolid() {
+  uint32_t c = strip.Color(current.r, current.g, current.b);
   for (int i = 0; i < NUM_LEDS; i++) strip.setPixelColor(i, c);
 }
 
-void renderThinking() {
-  // A purple "scanner" dot sweeps back and forth
-  float phase = (millis() % 1600) / 1600.0;
+void renderBreathe() {
+  unsigned long t = millis() - current.startedAt;
+  float phase = (t % current.period) / (float)current.period;
+  float s = (sin(phase * 2.0 * PI) + 1.0) / 2.0;
+  uint32_t c = strip.Color((uint8_t)(current.r * s),
+                           (uint8_t)(current.g * s),
+                           (uint8_t)(current.b * s));
+  for (int i = 0; i < NUM_LEDS; i++) strip.setPixelColor(i, c);
+}
+
+void renderBlink() {
+  unsigned long t = millis() - current.startedAt;
+  uint16_t half = current.period / 2;
+  if (half == 0) half = 1;
+  bool on = (t / half) % 2 == 0;
+  uint32_t c = on ? strip.Color(current.r, current.g, current.b) : 0;
+  for (int i = 0; i < NUM_LEDS; i++) strip.setPixelColor(i, c);
+}
+
+void renderScanner() {
+  unsigned long t = millis() - current.startedAt;
+  float phase = (t % current.period) / (float)current.period;
   float pos = (sin(phase * 2.0 * PI) + 1.0) / 2.0 * (NUM_LEDS - 1);
   int center = (int)round(pos);
 
   for (int i = 0; i < NUM_LEDS; i++) {
     int dist = abs(i - center);
-    if (dist == 0) strip.setPixelColor(i, strip.Color(90, 0, 170));
-    else if (dist == 1) strip.setPixelColor(i, strip.Color(35, 0, 70));
-    else strip.setPixelColor(i, 0);
+    if (dist == 0) {
+      strip.setPixelColor(i, strip.Color(current.r, current.g, current.b));
+    } else if (dist == 1) {
+      strip.setPixelColor(i, strip.Color(current.r / 4, current.g / 4, current.b / 4));
+    } else {
+      strip.setPixelColor(i, 0);
+    }
   }
 }
 
-void renderToolRunning() {
-  uint8_t b = breathe(900, 30, 255); // fast yellow/orange pulse
-  uint32_t c = strip.Color(b, b / 2, 0);
-  for (int i = 0; i < NUM_LEDS; i++) strip.setPixelColor(i, c);
-}
-
-void renderWaitingInput() {
-  uint8_t b = breathe(2500, 20, 200); // slow white pulse
-  uint32_t c = strip.Color(b, b, b);
-  for (int i = 0; i < NUM_LEDS; i++) strip.setPixelColor(i, c);
-}
-
-void renderSuccess() {
-  unsigned long elapsed = millis() - stateChangedAt;
-  unsigned long phase = elapsed % 1600;
-  int litCount = (phase < 800) ? map(phase, 0, 800, 0, NUM_LEDS) : NUM_LEDS;
+void renderFill() {
+  unsigned long t = millis() - current.startedAt;
+  unsigned long phase = t % current.period;
+  uint16_t half = current.period / 2;
+  int litCount = (phase < half) ? (int)map(phase, 0, half, 0, NUM_LEDS) : NUM_LEDS;
+  uint32_t c = strip.Color(current.r, current.g, current.b);
   for (int i = 0; i < NUM_LEDS; i++) {
-    strip.setPixelColor(i, i < litCount ? strip.Color(0, 220, 0) : 0);
+    strip.setPixelColor(i, i < litCount ? c : 0);
   }
 }
 
-void renderError() {
-  bool on = ((millis() - stateChangedAt) / 150) % 2 == 0;
-  uint32_t c = on ? strip.Color(180, 0, 0) : 0;
-  for (int i = 0; i < NUM_LEDS; i++) strip.setPixelColor(i, c);
+void renderOff() {
+  strip.clear();
 }
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
   strip.begin();
-  strip.setBrightness(MAX_BRIGHTNESS);
+  strip.setBrightness(MAX_BRIGHTNESS);  // initial ceiling; each command re-scales via bright_pct
   strip.clear();
   strip.show();
-  stateChangedAt = millis();
+  current.startedAt = millis();
 }
 
 void loop() {
@@ -147,14 +208,13 @@ void loop() {
     handleCommand(cmd);
   }
 
-  switch (currentState) {
-    case STATE_IDLE:          renderIdle(); break;
-    case STATE_THINKING:      renderThinking(); break;
-    case STATE_TOOL_RUNNING:  renderToolRunning(); break;
-    case STATE_WAITING_INPUT: renderWaitingInput(); break;
-    case STATE_SUCCESS:       renderSuccess(); break;
-    case STATE_ERROR:         renderError(); break;
-    case STATE_OFF:           strip.clear(); break;
+  switch (current.anim) {
+    case ANIM_SOLID:   renderSolid();   break;
+    case ANIM_BREATHE: renderBreathe(); break;
+    case ANIM_BLINK:   renderBlink();   break;
+    case ANIM_SCANNER: renderScanner(); break;
+    case ANIM_FILL:    renderFill();    break;
+    case ANIM_OFF:     renderOff();     break;
   }
 
   strip.show();
