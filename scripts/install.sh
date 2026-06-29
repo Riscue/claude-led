@@ -56,6 +56,59 @@ is_pid_alive() {
   [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
+warn_serial_access() {
+  # Linux-only: USB-serial devices (/dev/ttyUSB*, /dev/ttyACM*) are owned by
+  # the `dialout` group on Debian/Ubuntu, `uucp` on Arch. If the user isn't in
+  # that group, pyserial open fails with "Permission denied" — the daemon logs
+  # it to journald, but hook commands use --quiet so nothing surfaces on the
+  # CLI side and the LED just stays dark. Catch it here at install time.
+  [[ "$(detect_platform)" == "linux" ]] || return 0
+  local device="" group_name
+  for pattern in /dev/ttyUSB* /dev/ttyACM*; do
+    [[ -e "$pattern" ]] || continue
+    device="$pattern"
+    break
+  done
+  # Nothing plugged in right now — can't check, just bail.
+  [[ -n "$device" ]] || return 0
+  # Access works (covers group membership + ACLs + same-user).
+  [[ -r "$device" && -w "$device" ]] && return 0
+
+  group_name="$(stat -c '%G' "$device")"
+  echo ""
+  echo "    WARNING: no read/write access to $device"
+  echo "      the daemon will run but cannot open the serial port — LED commands"
+  echo "      will be stashed and the strip will stay dark. Symptoms in the log:"
+  echo "        'serial open failed: ... Permission denied'"
+  if id -nG | tr ' ' '\n' | grep -qx "$group_name"; then
+    echo "      your user is already in the '$group_name' group, but this shell"
+    echo "      session doesn't see it yet — log out and back in, or run:"
+    echo "        newgrp $group_name"
+    echo "      then restart the daemon:"
+    echo "        systemctl --user restart $LABEL.service"
+  else
+    echo "      add yourself to the '$group_name' group:"
+    echo "        sudo usermod -aG $group_name $USER"
+    echo "      then log out and back in (or run 'newgrp $group_name') for it to"
+    echo "      take effect, and restart the daemon:"
+    echo "        systemctl --user restart $LABEL.service"
+  fi
+}
+
+ensure_user_bus_env() {
+  # sudo -i strips XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS, so systemctl
+  # --user inside a dropped-privileges shell can't find the user bus (fails
+  # with "Failed to connect to bus: No medium found"). Restore the canonical
+  # defaults when they are missing; leave existing values alone so non-default
+  # runtime locations are respected.
+  if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+  fi
+  if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && [[ -S "$XDG_RUNTIME_DIR/bus" ]]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+  fi
+}
+
 # ----------------------------------------------------------------------------
 # install / uninstall (require sudo)
 # ----------------------------------------------------------------------------
@@ -179,6 +232,10 @@ cmd_install_user_unit() {
   local python_bin="${1:-$(command -v python3)}"
   local log_level="${2:-${CLAUDE_LED_LOG_LEVEL:-INFO}}"
   [[ -n "$python_bin" ]] || { echo "python3 not found" >&2; exit 1; }
+  # Stop any manually-started daemon first. Otherwise systemd/launchd fails to
+  # bind the socket ("another daemon is already listening") and restart-loops;
+  # during the rare race window both can briefly run at once.
+  cmd_stop
   case "$(detect_platform)" in
     macos) install_macos_user_unit "$python_bin" "$log_level" ;;
     linux) install_linux_user_unit "$python_bin" "$log_level" ;;
@@ -197,6 +254,7 @@ cmd_uninstall_user_unit() {
       fi
       ;;
     linux)
+      ensure_user_bus_env
       if [[ -f "$SYSTEMD_DEST" ]]; then
         systemctl --user disable --now "$LABEL.service" 2>/dev/null || true
         rm -f "$SYSTEMD_DEST"
@@ -231,10 +289,12 @@ install_macos_user_unit() {
 install_linux_user_unit() {
   local python_bin="$1"
   local log_level="${2:-INFO}"
+  ensure_user_bus_env
   mkdir -p "$(dirname "$SYSTEMD_DEST")"
   write_systemd_unit "$python_bin" "$SYSTEMD_DEST" "$log_level"
   systemctl --user daemon-reload
   systemctl --user enable --now "$LABEL.service"
+  warn_serial_access
   if ! loginctl show-user "$USER" 2>/dev/null | grep -q '^Linger=yes'; then
     echo ""
     echo "    NOTE: run 'loginctl enable-linger $USER' so the unit starts at boot"

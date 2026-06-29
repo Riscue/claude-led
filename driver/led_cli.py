@@ -27,6 +27,9 @@ Usage:
     # Raw mode (direct animation, for testing/custom use):
     python3 led_cli.py --raw breathe --rgb 0,50,220 --period 3500
     python3 led_cli.py --raw solid --rgb 0,0,255 --brightness 30
+    python3 led_cli.py --raw strobe --rgb 180,0,0 --rgb2 0,0,180 --period 300
+    python3 led_cli.py --raw level --rgb 0,220,0 --level 50
+    python3 led_cli.py --raw converge --rgb 0,50,220 --period 2000
     python3 led_cli.py --raw off
 
     # State mode (lookup from a JSON profile):
@@ -57,7 +60,8 @@ except ImportError:
 
 RESET_WAIT_SECONDS = 0.5
 BAUD_RATE = 115200
-ANIMATIONS = {"solid", "breathe", "blink", "scanner", "fill", "off"}
+ANIMATIONS = {"solid", "breathe", "blink", "scanner", "fill",
+              "strobe", "level", "converge", "off"}
 DAEMON_SOCKET_TIMEOUT = 0.3
 
 
@@ -154,6 +158,16 @@ def build_command_from_entry(entry, context: str) -> str:
     pct = max(0, min(100, int(entry.get("brightness", 100))))
     if anim == "solid":
         return f"solid {r} {g} {b} {pct}"
+    if anim == "level":
+        level = entry.get("level")
+        if isinstance(level, bool) or not isinstance(level, (int, float)):
+            raise ValueError(f"{context}: level required for animation {anim!r} (0-100)")
+        level = max(0, min(100, int(level)))
+        return f"level {r} {g} {b} {level} {pct}"
+    if anim == "strobe":
+        r2, g2, b2 = coerce_rgb_from_json(entry.get("rgb2"), context)
+        period = validate_period(entry.get("period"), anim, context)
+        return f"strobe {r} {g} {b} {r2} {g2} {b2} {period} {pct}"
     period = validate_period(entry.get("period"), anim, context)
     return f"{anim} {r} {g} {b} {period} {pct}"
 
@@ -172,7 +186,9 @@ def resolve_state(state_ref: str) -> str:
 
 
 def build_raw_command(anim: str, rgb: tuple[int, int, int] | None,
-                      period: int | None, pct: int) -> str:
+                      period: int | None, pct: int,
+                      rgb2: tuple[int, int, int] | None = None,
+                      level: int | None = None) -> str:
     if anim == "off":
         return "off"
     if rgb is None:
@@ -181,6 +197,17 @@ def build_raw_command(anim: str, rgb: tuple[int, int, int] | None,
     pct = max(0, min(100, pct))
     if anim == "solid":
         return f"solid {r} {g} {b} {pct}"
+    if anim == "level":
+        if level is None:
+            raise ValueError(f"--level required for animation {anim!r} (0-100)")
+        level = max(0, min(100, level))
+        return f"level {r} {g} {b} {level} {pct}"
+    if anim == "strobe":
+        if rgb2 is None:
+            raise ValueError(f"--rgb2 required for animation {anim!r}")
+        r2, g2, b2 = rgb2
+        validated_period = validate_period(period, anim, "raw")
+        return f"strobe {r} {g} {b} {r2} {g2} {b2} {validated_period} {pct}"
     validated_period = validate_period(period, anim, "raw")
     return f"{anim} {r} {g} {b} {validated_period} {pct}"
 
@@ -237,13 +264,17 @@ def main():
     parser = argparse.ArgumentParser(description="LED animation driver (generic)")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--raw", metavar="ANIM",
-                      help="Send a raw animation: solid/breathe/blink/scanner/fill/off")
+                      help="Send a raw animation: solid/breathe/blink/scanner/fill/strobe/level/converge/off")
     mode.add_argument("--state", metavar="PROFILE.KEY",
                       help="Look up a state in driver/states/<PROFILE>.json (e.g. claude.idle)")
     parser.add_argument("--rgb", default=None,
                         help="Color as 'r,g,b' (e.g. 0,50,220) or single value for grayscale (--raw only)")
+    parser.add_argument("--rgb2", default=None,
+                        help="Second color for strobe as 'r,g,b' (--raw only; required for strobe)")
     parser.add_argument("--period", type=int, default=None,
-                        help="Animation period in ms (--raw only; required for breathe/blink/scanner/fill)")
+                        help="Animation period in ms (--raw only; required for breathe/blink/scanner/fill/strobe/converge)")
+    parser.add_argument("--level", type=int, default=None,
+                        help="Level percentage 0-100 (--raw only; required for level animation)")
     parser.add_argument("--brightness", type=int, default=100,
                         help="Brightness 0-100 (default 100, scaled below firmware MAX_BRIGHTNESS)")
     parser.add_argument("--port", default=None,
@@ -259,7 +290,9 @@ def main():
             if args.raw not in ANIMATIONS:
                 raise ValueError(f"unknown animation {args.raw!r} (valid: {sorted(ANIMATIONS)})")
             rgb = parse_rgb(args.rgb) if args.rgb is not None else None
-            cmd = build_raw_command(args.raw, rgb, args.period, args.brightness)
+            rgb2 = parse_rgb(args.rgb2) if args.rgb2 is not None else None
+            cmd = build_raw_command(args.raw, rgb, args.period, args.brightness,
+                                    rgb2=rgb2, level=args.level)
         else:
             cmd = resolve_state(args.state)
     except ValueError as e:
