@@ -1,0 +1,19 @@
+{
+  "_comment": "Default profile. `led <key>` is shorthand for `led --state default.<key>` (e.g. `led off` == `led --state default.off`). Add more keys freely; no Python changes needed.",
+  "on": {
+    "animation": "converge",
+    "rgb": [0, 50, 220],
+    "period": 2000,
+    "brightness": 100
+  },
+  "çakar": {
+    "animation": "strobe",
+    "rgb": [180, 0, 0],
+    "rgb2": [0, 0, 180],
+    "period": 300,
+    "brightness": 100
+  },
+  "off": {
+    "animation": "off"
+  }
+}

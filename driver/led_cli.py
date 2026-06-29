@@ -36,6 +36,9 @@ Usage:
     python3 led_cli.py --state claude.idle
     python3 led_cli.py --quiet --state claude.error
 
+    # Default-profile shorthand (`led <key>` == `led --state default.<key>`):
+    python3 led_cli.py off
+
     # Bypass the daemon and talk to the serial port directly (debug):
     python3 led_cli.py --direct --state claude.idle
 
@@ -262,11 +265,13 @@ def send_via_daemon(cmd: str, quiet: bool = False,
 
 def main():
     parser = argparse.ArgumentParser(description="LED animation driver (generic)")
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group(required=False)
     mode.add_argument("--raw", metavar="ANIM",
                       help="Send a raw animation: solid/breathe/blink/scanner/fill/strobe/level/converge/off")
     mode.add_argument("--state", metavar="PROFILE.KEY",
                       help="Look up a state in driver/states/<PROFILE>.json (e.g. claude.idle)")
+    parser.add_argument("key", nargs="?", default=None,
+                        help="Shorthand for --state default.<key> (e.g. `led off`)")
     parser.add_argument("--rgb", default=None,
                         help="Color as 'r,g,b' (e.g. 0,50,220) or single value for grayscale (--raw only)")
     parser.add_argument("--rgb2", default=None,
@@ -285,6 +290,11 @@ def main():
                         help="Stay silent if the LED is missing or fails (do not interrupt Claude Code)")
     args = parser.parse_args()
 
+    if (args.raw or args.state) and args.key:
+        parser.error("positional <key> cannot be combined with --raw or --state")
+    if not (args.raw or args.state or args.key):
+        parser.error("expected one of: --raw ANIM, --state PROFILE.KEY, or positional <key>")
+
     try:
         if args.raw:
             if args.raw not in ANIMATIONS:
@@ -294,7 +304,7 @@ def main():
             cmd = build_raw_command(args.raw, rgb, args.period, args.brightness,
                                     rgb2=rgb2, level=args.level)
         else:
-            cmd = resolve_state(args.state)
+            cmd = resolve_state(args.state or f"default.{args.key}")
     except ValueError as e:
         if not args.quiet:
             print(f"Error: {e}", file=sys.stderr)
