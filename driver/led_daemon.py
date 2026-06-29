@@ -2,11 +2,12 @@
 """
 LED Daemon
 ----------
-Long-running background process that holds the ESP8266 serial port open and
-accepts animation commands over a Unix domain socket. Stays generic: it knows
-only the wire protocol (animation + RGB + period + brightness), which is the
-same as the firmware's. The Claude Code state -> animation mapping is resolved
-by led_cli.py (the client) before commands reach the daemon.
+Long-running background process that holds the ESP8266 serial port open,
+aggregates state across multiple concurrent client sessions, and forwards the
+highest-priority live state to the firmware. Stays Claude-agnostic: it knows
+only opaque session IDs, priority numbers, and the firmware wire protocol.
+The Claude Code state → priority mapping is resolved by led_cli.py (the
+client) before commands reach the daemon.
 
 Why a daemon:
     The ESP8266 resets on every serial-open (CH340 DTR line). A one-shot CLI
@@ -16,14 +17,38 @@ Why a daemon:
     direct-serial fallback when the daemon is down. `led_cli.py --direct`
     bypasses the daemon for debug only.
 
+    The daemon also aggregates state across multiple concurrent sessions
+    (e.g. several Claude Code terminals running in parallel). Each session's
+    state is tagged with a priority; the highest-priority live state is what
+    reaches the firmware. This lets one session's `error` override another's
+    `thinking`, and lets one session close without darkening the strip while
+    others are still active.
+
 Socket:
     ~/.claude-led/led.sock (override with CLAUDE_LED_SOCKET).
     Directory mode 0700, socket file mode 0600.
 
-Wire protocol (over the socket, same as firmware):
+Wire protocol (over the socket, CLI → daemon):
+    STATE <sid> <priority> <wire-line...>     upsert session; recompute aggregate
+    CLEAR <sid>                                remove session; recompute
+    TRANSIENT <ttl_ms> <wire-line...>          one-shot override, expires after ttl
+
+    <wire-line> is the firmware command (e.g. "blink 180 0 0 300 100") and is
+    passed through byte-for-byte as an opaque remainder — the daemon does not
+    parse animation names or field counts.
+
+Daemon → firmware wire protocol (unchanged):
     <anim> <r> <g> <b> [<period_ms>] [<bright_pct>]\n
-    One command per connection. Multiple newline-separated commands in a single
-    payload are also accepted.
+
+Aggregation:
+    The highest-priority live session wins. While a TRANSIENT entry is live
+    (within its TTL), it overrides the session aggregate unconditionally. With
+    no sessions and no live transient, the daemon emits "off".
+
+    The daemon treats both <sid> and <priority> as opaque — it does not know
+    which state name a priority corresponds to. The state → priority mapping
+    lives entirely in driver/states/<profile>.json and is resolved by led_cli.py
+    before commands reach the daemon.
 
 Started by scripts/install.sh, or directly for foreground debugging.
 """
@@ -37,6 +62,7 @@ import signal
 import socket
 import sys
 import time
+from dataclasses import dataclass
 from threading import Event
 
 try:
@@ -46,13 +72,26 @@ except ImportError:
     serial = None
     SerialException = OSError
 
-from led_cli import BAUD_RATE, RESET_WAIT_SECONDS, find_esp8266_port
+from protocol import BAUD_RATE, RESET_WAIT_SECONDS, find_esp8266_port
 
 RECONNECT_INTERVAL = 2.0
 ACCEPT_TIMEOUT = 1.0
 CLIENT_TIMEOUT = 0.5
 LISTEN_BACKLOG = 8
 RECV_BUFFER = 256
+
+
+@dataclass
+class SessionEntry:
+    priority: int
+    wire: str           # full firmware line, e.g. "blink 180 0 0 300 100"
+    updated_at: float   # time.monotonic(); tie-breaker within a priority tier
+
+
+@dataclass
+class TransientEntry:
+    wire: str
+    expires_at: float   # time.monotonic() + ttl_seconds
 
 
 def socket_path() -> str:
@@ -118,6 +157,14 @@ class Daemon:
         # NOT queue every command: replaying a burst of intermediate states
         # would strobe the strip through stale animations.
         self.pending_command: str | None = None
+        # Multi-session aggregation state. Sessions are keyed by an opaque sid
+        # supplied by the client; priority is also opaque (the state → priority
+        # mapping lives in JSON profiles, resolved client-side). The daemon
+        # only knows "higher number wins". Transient overrides the aggregate
+        # while its TTL is live.
+        self.sessions: dict[str, SessionEntry] = {}
+        self.transient: TransientEntry | None = None
+        self.current_output: str | None = None  # redundant-emit suppression
 
     def open_serial_once(self) -> bool:
         try:
@@ -211,6 +258,13 @@ class Daemon:
             try:
                 client, _ = self.listen_sock.accept()
             except socket.timeout:
+                # The accept loop wakes every ACCEPT_TIMEOUT (1 s); fold
+                # transient TTL expiry into this tick so we don't need a
+                # background thread. Single-threaded — no locking needed.
+                if self.transient and self.transient.expires_at <= time.monotonic():
+                    self.log.debug("transient expired")
+                    self.transient = None
+                    self.recompute_and_emit()
                 continue
             except OSError:
                 break
@@ -247,7 +301,77 @@ class Daemon:
             if not line:
                 continue
             self.log.debug("recv: %s", line)
-            self.write_command(line)
+            self.dispatch_line(line)
+
+    def dispatch_line(self, line: str) -> None:
+        """Parse a protocol line (STATE/CLEAR/TRANSIENT) and update aggregation
+        state. Malformed lines are logged and dropped — the daemon never crashes
+        on bad input.
+        """
+        try:
+            sp = line.find(" ")
+            if sp < 0:
+                self.log.warning("malformed line, ignored: %s", line)
+                return
+            verb = line[:sp]
+            rest = line[sp + 1:].lstrip()
+
+            if verb == "STATE":
+                # STATE <sid> <priority> <wire-line...>
+                parts = rest.split(" ", 2)
+                if len(parts) != 3:
+                    self.log.warning("malformed STATE line, ignored: %s", line)
+                    return
+                sid, priority_s, wire = parts
+                self.sessions[sid] = SessionEntry(
+                    int(priority_s), wire, time.monotonic())
+                self.log.info("STATE %s pri=%s", sid, priority_s)
+                self.recompute_and_emit()
+            elif verb == "CLEAR":
+                # CLEAR <sid>
+                sid = rest.split(" ", 1)[0]
+                if not sid:
+                    self.log.warning("malformed CLEAR line, ignored: %s", line)
+                    return
+                if self.sessions.pop(sid, None) is not None:
+                    self.log.info("CLEAR %s", sid)
+                    self.recompute_and_emit()
+            elif verb == "TRANSIENT":
+                # TRANSIENT <ttl_ms> <wire-line...>
+                parts = rest.split(" ", 1)
+                if len(parts) != 2:
+                    self.log.warning("malformed TRANSIENT line, ignored: %s", line)
+                    return
+                ttl_ms, wire = parts
+                self.transient = TransientEntry(
+                    wire, time.monotonic() + int(ttl_ms) / 1000.0)
+                self.log.info("TRANSIENT ttl=%sms", ttl_ms)
+                self.recompute_and_emit()
+            else:
+                self.log.warning("unknown verb, ignored: %s", line)
+        except (ValueError, IndexError) as e:
+            self.log.warning("dispatch failed for %r: %s", line, e)
+
+    def recompute_and_emit(self) -> None:
+        """Pick the highest-priority live state and forward it to the firmware.
+
+        Rules: a live transient overrides the session aggregate; otherwise the
+        highest-priority session wins (ties broken by recency — last write wins
+        within a tier). With nothing live, emit "off". Suppresses redundant
+        emits when the recomputed output matches what's already showing.
+        """
+        now = time.monotonic()
+        if self.transient and self.transient.expires_at > now:
+            output = self.transient.wire
+        elif self.sessions:
+            winner = max(self.sessions.values(),
+                         key=lambda e: (e.priority, e.updated_at))
+            output = winner.wire
+        else:
+            output = "off"
+        if output != self.current_output:
+            self.current_output = output
+            self.write_command(output)
 
     def signal_shutdown(self, signum, _frame):
         self.log.info("received signal %d, shutting down", signum)

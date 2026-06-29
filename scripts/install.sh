@@ -1,39 +1,26 @@
 #!/usr/bin/env bash
-# install.sh — install / uninstall / control the claude-led daemon.
+# install.sh — install / uninstall the claude-led daemon (user-level, no sudo).
 #
-# System files installed under /opt/claude-led (root-owned):
-#   /opt/claude-led/led_cli.py        (CLI client; symlinked as /usr/local/bin/led)
-#   /opt/claude-led/led_daemon.py     (persistent daemon)
-#   /opt/claude-led/states/*.json     (state profiles)
-#   /opt/claude-led/install.sh        (a copy of this script, for uninstall)
-#   /usr/local/bin/led               (symlink -> /opt/claude-led/led_cli.py)
-#
-# User files (no root required):
-#   ~/Library/LaunchAgents/tr.riscue.claude-led.plist  (macOS)
-#   ~/.config/systemd/user/tr.riscue.claude-led.service (Linux)
-#   ~/.claude-led/{led.sock,daemon.pid,daemon.log}      (runtime + daemon log)
+# Layout after install:
+#   ~/.claude-led/{led_cli.py, led_daemon.py, protocol.py, states/*.json}
+#   ~/.claude-led/{led.sock, daemon.pid, daemon.log}   (runtime, by daemon)
+#   ~/.local/bin/led                                   (symlink → led_cli.py)
+#   ~/Library/LaunchAgents/tr.riscue.claude-led.plist       (macOS, auto-start)
+#   ~/.config/systemd/user/tr.riscue.claude-led.service     (Linux, auto-start)
 #
 # Usage:
-#   sudo ./install.sh install          # install everything + start
-#   sudo ./install.sh uninstall        # remove everything
-#   ./install.sh start | stop | restart | status | logs
-#   ./install.sh foreground [-- args]  # run daemon in foreground (debug)
+#   ./install.sh install      # install files + enable auto-start at login
+#   ./install.sh uninstall    # remove everything
 
 set -eu
 
 LABEL="tr.riscue.claude-led"
-INSTALL_PREFIX="/opt/claude-led"
-DAEMON_PY="$INSTALL_PREFIX/led_daemon.py"
-CLI_PY="$INSTALL_PREFIX/led_cli.py"
-LED_SYMLINK="/usr/local/bin/led"
-SOCKET_DIR="$HOME/.claude-led"
-PID_FILE="$SOCKET_DIR/daemon.pid"
-LOG_FILE="$SOCKET_DIR/daemon.log"
-MACOS_PLIST_DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
-SYSTEMD_DEST="$HOME/.config/systemd/user/$LABEL.service"
-
-SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INSTALL_DIR="$HOME/.claude-led"
+BIN_DIR="$HOME/.local/bin"
+LED_SYMLINK="$BIN_DIR/led"
+LOG_FILE="$INSTALL_DIR/daemon.log"
+MACOS_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+SYSTEMD_UNIT="$HOME/.config/systemd/user/$LABEL.service"
 
 detect_platform() {
   case "$(uname -s)" in
@@ -43,64 +30,35 @@ detect_platform() {
   esac
 }
 
-is_under_supervisor() {
-  case "$(detect_platform)" in
-    macos) launchctl list "$LABEL" >/dev/null 2>&1 ;;
-    linux) systemctl --user is-active "$LABEL.service" >/dev/null 2>&1 ;;
-    *)     return 1 ;;
-  esac
-}
-
-is_pid_alive() {
-  local pid="$1"
-  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
-}
-
-warn_serial_access() {
-  # Linux-only: USB-serial devices (/dev/ttyUSB*, /dev/ttyACM*) are owned by
-  # the `dialout` group on Debian/Ubuntu, `uucp` on Arch. If the user isn't in
-  # that group, pyserial open fails with "Permission denied" — the daemon logs
-  # it to journald, but hook commands use --quiet so nothing surfaces on the
-  # CLI side and the LED just stays dark. Catch it here at install time.
-  [[ "$(detect_platform)" == "linux" ]] || return 0
-  local device="" group_name
-  for pattern in /dev/ttyUSB* /dev/ttyACM*; do
-    [[ -e "$pattern" ]] || continue
-    device="$pattern"
-    break
+find_python_with_pyserial() {
+  # Scan known python3 locations; return the first that can `import serial`.
+  for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    [[ -x "$candidate" ]] || continue
+    if "$candidate" -c 'import serial' 2>/dev/null; then
+      echo "$candidate"
+      return
+    fi
   done
-  # Nothing plugged in right now — can't check, just bail.
-  [[ -n "$device" ]] || return 0
-  # Access works (covers group membership + ACLs + same-user).
-  [[ -r "$device" && -w "$device" ]] && return 0
-
-  group_name="$(stat -c '%G' "$device")"
   echo ""
-  echo "    WARNING: no read/write access to $device"
-  echo "      the daemon will run but cannot open the serial port — LED commands"
-  echo "      will be stashed and the strip will stay dark. Symptoms in the log:"
-  echo "        'serial open failed: ... Permission denied'"
-  if id -nG | tr ' ' '\n' | grep -qx "$group_name"; then
-    echo "      your user is already in the '$group_name' group, but this shell"
-    echo "      session doesn't see it yet — log out and back in, or run:"
-    echo "        newgrp $group_name"
-    echo "      then restart the daemon:"
-    echo "        systemctl --user restart $LABEL.service"
+}
+
+resolve_source_dir() {
+  # When run from the repo, sources live in PROJECT_ROOT/driver/. When run from
+  # a previously-installed copy, they sit next to this script.
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$script_dir/led_cli.py" ]]; then
+    echo "$script_dir"
+  elif [[ -f "${script_dir}/../driver/led_cli.py" ]]; then
+    echo "${script_dir}/../driver"
   else
-    echo "      add yourself to the '$group_name' group:"
-    echo "        sudo usermod -aG $group_name $USER"
-    echo "      then log out and back in (or run 'newgrp $group_name') for it to"
-    echo "      take effect, and restart the daemon:"
-    echo "        systemctl --user restart $LABEL.service"
+    echo ""
   fi
 }
 
 ensure_user_bus_env() {
-  # sudo -i strips XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS, so systemctl
-  # --user inside a dropped-privileges shell can't find the user bus (fails
-  # with "Failed to connect to bus: No medium found"). Restore the canonical
-  # defaults when they are missing; leave existing values alone so non-default
-  # runtime locations are respected.
+  # sudo -i and some headless shells strip XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS.
+  # Restore canonical defaults so `systemctl --user` works.
   if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
     export XDG_RUNTIME_DIR="/run/user/$(id -u)"
   fi
@@ -109,233 +67,126 @@ ensure_user_bus_env() {
   fi
 }
 
+warn_serial_access() {
+  # Linux: USB-serial devices are owned by `dialout` (Debian/Ubuntu) or `uucp`
+  # (Arch). Without group membership the daemon can't open the port and the
+  # LED stays dark.
+  local device="" group_name
+  for pattern in /dev/ttyUSB* /dev/ttyACM*; do
+    [[ -e "$pattern" ]] || continue
+    device="$pattern"
+    break
+  done
+  [[ -n "$device" ]] || return 0
+  [[ -r "$device" && -w "$device" ]] && return 0
+  group_name="$(stat -c '%G' "$device")"
+  echo ""
+  echo "    WARNING: no read/write access to $device"
+  echo "      LED will stay dark. Add yourself to the '$group_name' group:"
+  echo "        sudo usermod -aG $group_name $USER"
+  echo "      then log out and back in (or 'newgrp $group_name') for it to take effect."
+}
+
 # ----------------------------------------------------------------------------
-# install / uninstall (require sudo)
+# install
 # ----------------------------------------------------------------------------
 
 cmd_install() {
-  [[ $EUID -eq 0 ]] || { echo "Run with: sudo $0 install" >&2; exit 1; }
-  [[ -n "${SUDO_USER:-}" ]] || { echo "SUDO_USER not set; invoke via sudo" >&2; exit 1; }
+  [[ $EUID -ne 0 ]] || { echo "This script is user-level; run WITHOUT sudo." >&2; exit 1; }
 
-  local target_user="$SUDO_USER"
-  if ! sudo -iu "$target_user" true 2>/dev/null; then
-    echo "cannot switch to user '$target_user' via sudo" >&2
-    exit 1
-  fi
+  local platform
+  platform="$(detect_platform)"
+  [[ "$platform" != "unknown" ]] || { echo "unsupported platform: $(uname -s)" >&2; exit 1; }
 
-  # Discover a python3 with pyserial installed. We cannot rely on `command -v`
-  # under `sudo -i` because secure_path hides Homebrew (and similar) — scan
-  # known locations explicitly. Scan as the target user so pyserial installed
-  # via `pip3 install --user` (common on system Python due to PEP 0668) is
-  # visible.
-  local user_python=""
-  for candidate in \
-      "/opt/homebrew/bin/python3" \
-      "/usr/local/bin/python3" \
-      "/usr/bin/python3"; do
-    if [[ -x "$candidate" ]] && sudo -iu "$target_user" "$candidate" -c 'import serial' 2>/dev/null; then
-      user_python="$candidate"
-      break
-    fi
-  done
-  [[ -n "$user_python" ]] || {
-    echo "no python3 with pyserial found in known locations" >&2
-    echo "  install pyserial for some python3, e.g.:" >&2
-    echo "    pip3 install pyserial        (Homebrew python)" >&2
-    echo "    /usr/bin/pip3 install pyserial  (system python)" >&2
+  local python_bin
+  python_bin="$(find_python_with_pyserial)"
+  [[ -n "$python_bin" ]] || {
+    echo "no python3 with pyserial found; install with: pip3 install pyserial" >&2
     exit 1
+  }
+
+  local src_dir
+  src_dir="$(resolve_source_dir)"
+  [[ -n "$src_dir" ]] || { echo "could not locate source files relative to $0" >&2; exit 1; }
+  [[ -f "$src_dir/states/claude.json" ]] || {
+    echo "no state JSON files found in $src_dir/states/" >&2; exit 1
   }
 
   local log_level="${CLAUDE_LED_LOG_LEVEL:-INFO}"
 
-  echo "==> Installing claude-led"
-  echo "    target user: $target_user"
-  echo "    python:      $user_python ($("$user_python" --version 2>&1))"
-  echo "    prefix:      $INSTALL_PREFIX"
+  echo "==> Installing claude-led (user-level)"
+  echo "    install dir: $INSTALL_DIR"
+  echo "    python:      $python_bin ($("$python_bin" --version 2>&1))"
   echo "    log level:   $log_level"
   echo ""
 
-  # Resolve source files. From the repo, they live under PROJECT_ROOT/driver/.
-  # From the installed copy at /opt/claude-led/install.sh (e.g. a refresh after
-  # the repo was deleted), they sit next to this script. Detect which.
-  local script_dir src_cli src_daemon src_states=()
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [[ -f "$script_dir/led_cli.py" ]]; then
-    src_cli="$script_dir/led_cli.py"
-    src_daemon="$script_dir/led_daemon.py"
-    src_states=("$script_dir/states"/*.json)
-  elif [[ -f "$PROJECT_ROOT/driver/led_cli.py" ]]; then
-    src_cli="$PROJECT_ROOT/driver/led_cli.py"
-    src_daemon="$PROJECT_ROOT/driver/led_daemon.py"
-    src_states=("$PROJECT_ROOT/driver/states"/*.json)
-  else
-    echo "could not locate led_cli.py relative to $SCRIPT_PATH" >&2
-    exit 1
-  fi
-  # Without nullglob, a non-matching glob leaves the literal pattern as the
-  # sole array element; verify the first entry is a real file.
-  if [[ ! -f "${src_states[0]:-}" ]]; then
-    echo "no state JSON files found alongside $src_cli" >&2
-    exit 1
-  fi
+  # 1. Copy files
+  mkdir -p "$INSTALL_DIR/states"
+  cp "$src_dir/led_cli.py"     "$INSTALL_DIR/"
+  cp "$src_dir/led_daemon.py"  "$INSTALL_DIR/"
+  cp "$src_dir/protocol.py"    "$INSTALL_DIR/"
+  cp "$src_dir/states/"*.json  "$INSTALL_DIR/states/"
+  chmod 755 "$INSTALL_DIR"/{led_cli.py,led_daemon.py,protocol.py}
+  chmod 644 "$INSTALL_DIR"/states/*.json
+  echo "    copied: led_cli.py, led_daemon.py, protocol.py, states/"
 
-  # /opt/claude-led files
-  mkdir -p "$INSTALL_PREFIX/states"
-  cp "$src_cli"          "$INSTALL_PREFIX/led_cli.py"
-  cp "$src_daemon"       "$INSTALL_PREFIX/led_daemon.py"
-  cp "${src_states[@]}"  "$INSTALL_PREFIX/states/"
-  cp "$SCRIPT_PATH"      "$INSTALL_PREFIX/install.sh"
-  chmod 755 "$INSTALL_PREFIX" \
-            "$INSTALL_PREFIX/led_cli.py" \
-            "$INSTALL_PREFIX/led_daemon.py" \
-            "$INSTALL_PREFIX/install.sh"
-  chmod 644 "$INSTALL_PREFIX"/states/*.json
+  # 2. Symlink led → led_cli.py on PATH
+  mkdir -p "$BIN_DIR"
+  ln -sf "$INSTALL_DIR/led_cli.py" "$LED_SYMLINK"
+  echo "    symlink: $LED_SYMLINK -> $INSTALL_DIR/led_cli.py"
 
-  # /usr/local/bin/led symlink
-  ln -sf "$INSTALL_PREFIX/led_cli.py" "$LED_SYMLINK"
+  # 3. Runtime dir doubles as install dir — chmod 700 so the socket (mode 600)
+  # lives in a private dir.
+  chmod 700 "$INSTALL_DIR" 2>/dev/null || true
 
-  echo "    installed: $INSTALL_PREFIX/{led_cli.py,led_daemon.py,states/,install.sh}"
-  echo "    symlink:   $LED_SYMLINK -> $INSTALL_PREFIX/led_cli.py"
+  # 4. Warn if BIN_DIR is not on PATH (hooks call `led` and need it findable)
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *)
+      echo ""
+      echo "    NOTE: $BIN_DIR is not on your PATH."
+      echo "      Add this to your shell rc (~/.zshrc, ~/.bashrc):"
+      echo "        export PATH=\"$BIN_DIR:\$PATH\""
+      ;;
+  esac
+
+  # 5. Write + load auto-start unit
+  case "$platform" in
+    macos) install_macos_unit "$python_bin" "$log_level" ;;
+    linux) install_linux_unit "$python_bin" "$log_level" ;;
+  esac
+
   echo ""
-
-  # Drop to target user for user-level unit installation
-  echo "==> Installing user unit for $target_user..."
-  sudo -iu "$target_user" "$SCRIPT_PATH" install-user-unit "$user_python" "$log_level"
+  echo "==> Done. Daemon will start at login."
 }
 
-cmd_uninstall() {
-  [[ $EUID -eq 0 ]] || { echo "Run with: sudo $0 uninstall" >&2; exit 1; }
-  [[ -n "${SUDO_USER:-}" ]] || { echo "SUDO_USER not set; invoke via sudo" >&2; exit 1; }
-
-  local target_user="$SUDO_USER"
-
-  echo "==> Uninstalling claude-led"
-
-  # First drop to user to unload + remove the user unit
-  sudo -iu "$target_user" "$SCRIPT_PATH" uninstall-user-unit || true
-
-  rm -f "$LED_SYMLINK"
-  echo "    removed: $LED_SYMLINK"
-
-  rm -rf "$INSTALL_PREFIX"
-  echo "    removed: $INSTALL_PREFIX"
-
-  echo "==> Done"
-}
-
-# ----------------------------------------------------------------------------
-# install-user-unit / uninstall-user-unit (run as target user via sudo -iu)
-# ----------------------------------------------------------------------------
-
-cmd_install_user_unit() {
-  [[ $EUID -ne 0 ]] || { echo "install-user-unit must run as user, not root" >&2; exit 1; }
-  local python_bin="${1:-$(command -v python3)}"
-  local log_level="${2:-${CLAUDE_LED_LOG_LEVEL:-INFO}}"
-  [[ -n "$python_bin" ]] || { echo "python3 not found" >&2; exit 1; }
-  # Stop any manually-started daemon first. Otherwise systemd/launchd fails to
-  # bind the socket ("another daemon is already listening") and restart-loops;
-  # during the rare race window both can briefly run at once.
-  cmd_stop
-  case "$(detect_platform)" in
-    macos) install_macos_user_unit "$python_bin" "$log_level" ;;
-    linux) install_linux_user_unit "$python_bin" "$log_level" ;;
-    *) echo "unsupported platform: $(detect_platform)" >&2; exit 1 ;;
-  esac
-}
-
-cmd_uninstall_user_unit() {
-  [[ $EUID -ne 0 ]] || { echo "uninstall-user-unit must run as user, not root" >&2; exit 1; }
-  case "$(detect_platform)" in
-    macos)
-      if [[ -f "$MACOS_PLIST_DEST" ]]; then
-        launchctl unload "$MACOS_PLIST_DEST" 2>/dev/null || true
-        rm -f "$MACOS_PLIST_DEST"
-        echo "    removed: $MACOS_PLIST_DEST"
-      fi
-      ;;
-    linux)
-      ensure_user_bus_env
-      if [[ -f "$SYSTEMD_DEST" ]]; then
-        systemctl --user disable --now "$LABEL.service" 2>/dev/null || true
-        rm -f "$SYSTEMD_DEST"
-        systemctl --user daemon-reload
-        echo "    removed: $SYSTEMD_DEST"
-      fi
-      ;;
-  esac
-}
-
-install_macos_user_unit() {
-  local python_bin="$1"
-  local log_level="${2:-INFO}"
-  mkdir -p "$(dirname "$MACOS_PLIST_DEST")"
-  mkdir -p "$SOCKET_DIR"
-  if ! chmod 700 "$SOCKET_DIR" 2>/dev/null; then
-    echo "warning: could not chmod 700 $SOCKET_DIR — if it is owned by root, chown it to yourself" >&2
-  fi
-
-  if [[ -f "$MACOS_PLIST_DEST" ]]; then
-    launchctl unload "$MACOS_PLIST_DEST" 2>/dev/null || true
-  fi
-
-  write_launchd_plist "$python_bin" "$MACOS_PLIST_DEST" "$LOG_FILE" "$log_level"
-  launchctl load "$MACOS_PLIST_DEST"
-  echo "    installed: $MACOS_PLIST_DEST"
-  echo "    python:    $python_bin"
-  echo "    log level: $log_level"
-  launchctl list "$LABEL" 2>&1 || true
-}
-
-install_linux_user_unit() {
-  local python_bin="$1"
-  local log_level="${2:-INFO}"
-  ensure_user_bus_env
-  mkdir -p "$(dirname "$SYSTEMD_DEST")"
-  write_systemd_unit "$python_bin" "$SYSTEMD_DEST" "$log_level"
-  systemctl --user daemon-reload
-  systemctl --user enable --now "$LABEL.service"
-  warn_serial_access
-  if ! loginctl show-user "$USER" 2>/dev/null | grep -q '^Linger=yes'; then
-    echo ""
-    echo "    NOTE: run 'loginctl enable-linger $USER' so the unit starts at boot"
-  fi
-  systemctl --user status "$LABEL.service" 2>&1 || true
-}
-
-write_launchd_plist() {
-  local python_bin="$1"
-  local dest="$2"
-  local log_file="$3"
-  local log_level="${4:-INFO}"
-  cat > "$dest" <<EOF
+install_macos_unit() {
+  local python_bin="$1" log_level="$2"
+  mkdir -p "$(dirname "$MACOS_PLIST")"
+  # Unload any prior version, then write + load.
+  launchctl unload "$MACOS_PLIST" 2>/dev/null || true
+  cat > "$MACOS_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
   <string>${LABEL}</string>
-
   <key>ProgramArguments</key>
   <array>
     <string>${python_bin}</string>
-    <string>${DAEMON_PY}</string>
+    <string>${INSTALL_DIR}/led_daemon.py</string>
   </array>
-
   <key>RunAtLoad</key>
   <true/>
-
   <key>KeepAlive</key>
   <true/>
-
   <key>ThrottleInterval</key>
   <integer>5</integer>
-
   <key>StandardOutPath</key>
-  <string>${log_file}</string>
-
+  <string>${LOG_FILE}</string>
   <key>StandardErrorPath</key>
-  <string>${log_file}</string>
-
+  <string>${LOG_FILE}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>CLAUDE_LED_LOG_LEVEL</key>
@@ -346,20 +197,22 @@ write_launchd_plist() {
 </dict>
 </plist>
 EOF
+  launchctl load "$MACOS_PLIST"
+  echo "    auto-start: $MACOS_PLIST (launchd, RunAtLoad + KeepAlive)"
 }
 
-write_systemd_unit() {
-  local python_bin="$1"
-  local dest="$2"
-  local log_level="${3:-INFO}"
-  cat > "$dest" <<EOF
+install_linux_unit() {
+  local python_bin="$1" log_level="$2"
+  ensure_user_bus_env
+  mkdir -p "$(dirname "$SYSTEMD_UNIT")"
+  cat > "$SYSTEMD_UNIT" <<EOF
 [Unit]
 Description=claude-led daemon
 After=default.target
 
 [Service]
 Type=simple
-ExecStart=${python_bin} ${DAEMON_PY}
+ExecStart=${python_bin} ${INSTALL_DIR}/led_daemon.py
 Restart=on-failure
 RestartSec=2
 Environment=CLAUDE_LED_LOG_LEVEL=${log_level}
@@ -368,160 +221,82 @@ Environment=PYTHONUNBUFFERED=1
 [Install]
 WantedBy=default.target
 EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$LABEL.service"
+  echo "    auto-start: $SYSTEMD_UNIT (systemd --user, enable --now + Restart=on-failure)"
+  if ! loginctl show-user "$USER" 2>/dev/null | grep -q '^Linger=yes'; then
+    echo ""
+    echo "    NOTE: run 'loginctl enable-linger $USER' so the daemon starts at boot"
+    echo "          (without linger, it starts when you log in)"
+  fi
+  warn_serial_access
 }
 
 # ----------------------------------------------------------------------------
-# start / stop / restart / status / logs / foreground (no sudo)
+# uninstall
 # ----------------------------------------------------------------------------
 
-cmd_foreground() {
-  [[ -f "$DAEMON_PY" ]] || { echo "$DAEMON_PY not found; run 'sudo $0 install' first" >&2; exit 1; }
-  exec "$DAEMON_PY" "$@"
-}
+cmd_uninstall() {
+  [[ $EUID -ne 0 ]] || { echo "This script is user-level; run WITHOUT sudo." >&2; exit 1; }
 
-cmd_start() {
-  if is_under_supervisor; then
-    echo "supervisor manages $LABEL; delegating start"
-    case "$(detect_platform)" in
-      macos) launchctl kickstart -k "gui/$(id -u)/$LABEL" ;;
-      linux) systemctl --user restart "$LABEL.service" ;;
-    esac
-    return
-  fi
-  [[ -f "$DAEMON_PY" ]] || { echo "$DAEMON_PY not found; run 'sudo $0 install' first" >&2; exit 1; }
-  if [[ -f "$PID_FILE" ]] && is_pid_alive "$(cat "$PID_FILE" 2>/dev/null)"; then
-    echo "daemon already running (pid $(cat "$PID_FILE"))"
-    return 0
-  fi
-  rm -f "$PID_FILE"
-  mkdir -p "$SOCKET_DIR"
-  chmod 700 "$SOCKET_DIR"
-  echo "starting daemon (manual; log: $LOG_FILE)"
-  nohup "$DAEMON_PY" >>"$LOG_FILE" 2>&1 &
-  echo $! > "$PID_FILE"
-  sleep 0.2
-  if is_pid_alive "$(cat "$PID_FILE")"; then
-    echo "started (pid $(cat "$PID_FILE"))"
-  else
-    echo "failed to start; check $LOG_FILE" >&2
-    return 1
-  fi
-}
+  local platform
+  platform="$(detect_platform)"
 
-cmd_stop() {
-  if is_under_supervisor; then
-    echo "supervisor manages $LABEL; delegating stop"
-    case "$(detect_platform)" in
-      macos) launchctl kill TERM "gui/$(id -u)/$LABEL" ;;
-      linux) systemctl --user stop "$LABEL.service" ;;
-    esac
-    return
-  fi
-  if [[ ! -f "$PID_FILE" ]]; then
-    echo "no pid file; not running under $0"
-    return 0
-  fi
-  local pid; pid="$(cat "$PID_FILE" 2>/dev/null)"
-  if is_pid_alive "$pid"; then
-    echo "stopping daemon (pid $pid)"
-    kill -TERM "$pid"
-    for _ in {1..50}; do
-      is_pid_alive "$pid" || break
-      sleep 0.1
-    done
-    if is_pid_alive "$pid"; then
-      echo "daemon did not exit; sending KILL" >&2
-      kill -KILL "$pid" 2>/dev/null || true
-    fi
-  else
-    echo "pid $pid not alive; cleaning pid file"
-  fi
-  rm -f "$PID_FILE"
-}
+  echo "==> Uninstalling claude-led"
 
-cmd_restart() {
-  cmd_stop
-  cmd_start
-}
-
-cmd_status() {
-  if is_under_supervisor; then
-    echo "under supervisor:"
-    case "$(detect_platform)" in
-      macos) launchctl list "$LABEL" 2>&1 ;;
-      linux) systemctl --user status "$LABEL.service" 2>&1 ;;
-    esac
-    return
-  fi
-  if [[ -f "$PID_FILE" ]] && is_pid_alive "$(cat "$PID_FILE" 2>/dev/null)"; then
-    echo "running (pid $(cat "$PID_FILE"), manual)"
-    return
-  fi
-  echo "not running"
-}
-
-cmd_logs() {
-  case "$(detect_platform)" in
+  case "$platform" in
     macos)
-      if [[ -f "$LOG_FILE" ]]; then
-        tail -f "$LOG_FILE"
-      else
-        echo "no log file found; run '$0 install' or '$0 start' first" >&2
-        return 1
+      if [[ -f "$MACOS_PLIST" ]]; then
+        launchctl unload "$MACOS_PLIST" 2>/dev/null || true
+        rm -f "$MACOS_PLIST"
+        echo "    removed: $MACOS_PLIST"
       fi
       ;;
     linux)
-      if is_under_supervisor; then
-        journalctl --user -u "$LABEL.service" -f
-      elif [[ -f "$LOG_FILE" ]]; then
-        tail -f "$LOG_FILE"
-      else
-        echo "no log file found" >&2
-        return 1
+      ensure_user_bus_env
+      if [[ -f "$SYSTEMD_UNIT" ]]; then
+        systemctl --user disable --now "$LABEL.service" 2>/dev/null || true
+        rm -f "$SYSTEMD_UNIT"
+        systemctl --user daemon-reload
+        echo "    removed: $SYSTEMD_UNIT"
       fi
       ;;
   esac
+
+  rm -f "$LED_SYMLINK"
+  echo "    removed: $LED_SYMLINK"
+
+  rm -rf "$INSTALL_DIR"
+  echo "    removed: $INSTALL_DIR"
+  echo "==> Done"
 }
+
+# ----------------------------------------------------------------------------
 
 usage() {
   cat <<EOF
 Usage: $0 <command>
 
-Install / uninstall (require sudo):
-  install       install /opt/claude-led + /usr/local/bin/led + user unit
-  uninstall     remove all of the above
+Commands:
+  install     Install claude-led (user-level) + enable auto-start at login
+  uninstall   Stop the daemon and remove all installed files
 
-Daemon control (no sudo; managed by launchd/systemd if installed):
-  start         start the daemon (delegates to supervisor if installed)
-  stop          stop the daemon
-  restart       stop then start
-  status        show daemon / supervisor status
-  logs          tail daemon logs
-  foreground    run the daemon in the foreground (debug); extra args pass through
+Auto-start:
+  macOS:  $MACOS_PLIST
+  Linux:  $SYSTEMD_UNIT
 
-Layout after install:
-  /opt/claude-led/{led_cli.py, led_daemon.py, states/, install.sh}
-  /usr/local/bin/led -> /opt/claude-led/led_cli.py
-  ~/Library/LaunchAgents/$LABEL.plist   (macOS)
-  ~/.config/systemd/user/$LABEL.service (Linux)
+Files installed:
+  $INSTALL_DIR/{{led_cli,led_daemon,protocol}.py, states/*.json}
+  $LED_SYMLINK → $INSTALL_DIR/led_cli.py
 EOF
 }
 
 main() {
   local cmd="${1:-}"
-  [[ $# -gt 0 ]] && shift
   case "$cmd" in
-    install)            cmd_install ;;
-    uninstall)          cmd_uninstall ;;
-    install-user-unit)  cmd_install_user_unit "$@" ;;
-    uninstall-user-unit) cmd_uninstall_user_unit ;;
-    start)              cmd_start ;;
-    stop)               cmd_stop ;;
-    restart)            cmd_restart ;;
-    status)             cmd_status ;;
-    logs)               cmd_logs ;;
-    foreground)         cmd_foreground "$@" ;;
-    -h|--help|help|"")  usage ;;
+    install)   cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    -h|--help|help|"") usage ;;
     *) echo "unknown command: $cmd" >&2; usage >&2; exit 1 ;;
   esac
 }

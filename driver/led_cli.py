@@ -2,42 +2,55 @@
 """
 LED Animation Driver (generic, thin client)
 -----------------------------------------
-Sends animation commands to the ESP8266. The driver is state-agnostic: it
-knows the wire protocol (animation + RGB + period + brightness) but nothing
-about Claude Code or any other upstream application.
+Resolves a state (or raw animation) to a firmware wire line and forwards it
+to led_daemon.py. The driver is state-agnostic: it knows the wire protocol
+(animation + RGB + period + brightness) and the JSON profile format, but
+nothing about Claude Code beyond the profile name passed on the command line.
 
 The driver is a thin client: it connects to led_daemon.py over a Unix domain
-socket (~/.claude-led/led.sock) and forwards the resolved wire command. The
-daemon holds the serial port open, which avoids the 0.5 s ESP8266 reset wait
-(the CH340 DTR line toggles reset on every serial-open).
+socket (~/.claude-led/led.sock). The daemon holds the serial port open (which
+avoids the 0.5 s ESP8266 reset wait) and aggregates state across multiple
+concurrent sessions.
 
 The daemon is mandatory. If it is not running, the command is dropped (the
 LED is not updated) — there is no automatic direct-serial fallback. Use
 --direct to bypass the daemon for debug; it is not intended for hook use.
 
 State mappings live as JSON profiles in driver/states/. Each profile is a flat
-dict of {state_name: {animation, rgb, period, brightness}}. Use --state
-<profile>.<key> to load one. Add new profiles (git.json, slack.json, ...) by
-dropping new JSON files in driver/states/ -- no Python changes required.
+dict of {state_name: {animation, rgb, period, brightness, [priority]}}. Use
+--state <profile>.<key> to load one. Add new profiles (git.json, slack.json,
+...) by dropping new JSON files in driver/states/ -- no Python changes
+required.
+
+Modes (daemon path):
+    --session <sid>      STATE       aggregated; competes by priority with other
+                                     live sessions. Defaults to $CLAUDE_SESSION_ID.
+    --end-session <sid>  CLEAR       remove a session from the daemon's map.
+                                     Defaults to $CLAUDE_SESSION_ID.
+    (neither)            TRANSIENT   one-shot TTL flash (default 3 s, override
+                                     with --ttl or $CLAUDE_LED_TRANSIENT_TTL_MS).
 
 Setup:
     pip3 install pyserial
 
 Usage:
-    # Raw mode (direct animation, for testing/custom use):
-    python3 led_cli.py --raw breathe --rgb 0,50,220 --period 3500
-    python3 led_cli.py --raw solid --rgb 0,0,255 --brightness 30
-    python3 led_cli.py --raw strobe --rgb 180,0,0 --rgb2 0,0,180 --period 300
-    python3 led_cli.py --raw level --rgb 0,220,0 --level 50
-    python3 led_cli.py --raw converge --rgb 0,50,220 --period 2000
-    python3 led_cli.py --raw off
+    # State lookup, aggregated as part of a Claude Code session:
+    python3 led_cli.py --quiet --session $CLAUDE_SESSION_ID --state claude.idle
 
-    # State mode (lookup from a JSON profile):
-    python3 led_cli.py --state claude.idle
-    python3 led_cli.py --quiet --state claude.error
+    # SessionEnd:
+    python3 led_cli.py --quiet --end-session $CLAUDE_SESSION_ID
+
+    # Ad-hoc transient flash (no session context — reverts after TTL):
+    python3 led_cli.py --state claude.error
+    python3 led_cli.py --state claude.error --ttl 10000
 
     # Default-profile shorthand (`led <key>` == `led --state default.<key>`):
     python3 led_cli.py off
+
+    # Raw mode (direct animation, for testing/custom use):
+    python3 led_cli.py --raw breathe --rgb 0,50,220 --period 3500
+    python3 led_cli.py --raw strobe --rgb 180,0,0 --rgb2 0,0,180 --period 300
+    python3 led_cli.py --raw off
 
     # Bypass the daemon and talk to the serial port directly (debug):
     python3 led_cli.py --direct --state claude.idle
@@ -49,7 +62,6 @@ found, set the CLAUDE_LED_PORT environment variable or pass --port.
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import socket
@@ -61,28 +73,14 @@ try:
 except ImportError:
     serial = None
 
-RESET_WAIT_SECONDS = 0.5
-BAUD_RATE = 115200
+from protocol import BAUD_RATE, RESET_WAIT_SECONDS, find_esp8266_port, socket_path
+
 ANIMATIONS = {"solid", "breathe", "blink", "scanner", "fill",
               "strobe", "level", "converge", "off"}
+# Animations that need a period_ms parameter.
+PERIOD_ANIMATIONS = {"breathe", "blink", "scanner", "fill", "converge", "strobe"}
 DAEMON_SOCKET_TIMEOUT = 0.3
-
-
-def socket_path() -> str:
-    """Path to the daemon's Unix socket. Override with CLAUDE_LED_SOCKET."""
-    override = os.environ.get("CLAUDE_LED_SOCKET")
-    if override:
-        return override
-    return os.path.join(os.path.expanduser("~"), ".claude-led", "led.sock")
-
-
-def find_esp8266_port() -> str | None:
-    candidates = []
-    for pattern in ("/dev/cu.wchusbserial*", "/dev/cu.usbserial-*", "/dev/cu.SLAB_USBtoUART*", "/dev/cu.usbmodem*"):
-        candidates.extend(glob.glob(pattern))
-    candidates.extend(glob.glob("/dev/ttyUSB*"))
-    candidates.extend(glob.glob("/dev/ttyACM*"))
-    return candidates[0] if candidates else None
+DEFAULT_TRANSIENT_TTL_MS = 3000
 
 
 def parse_rgb(s: str) -> tuple[int, int, int]:
@@ -138,44 +136,99 @@ def coerce_rgb_from_json(rgb, context: str) -> tuple[int, int, int]:
             max(0, min(255, values[2])))
 
 
-def validate_period(period, anim: str, context: str) -> int:
+def validate_period(period, anim: str) -> int:
     """Period is required and must be a number >= 50 ms for time-based animations."""
     if isinstance(period, bool) or period is None:
-        raise ValueError(f"{context}: period required for animation {anim!r} (number >= 50 ms)")
+        raise ValueError(f"period required for animation {anim!r} (number >= 50 ms)")
     if not isinstance(period, (int, float)):
-        raise ValueError(f"{context}: period must be a number for animation {anim!r}")
+        raise ValueError(f"period for animation {anim!r} must be a number")
     if period < 50:
-        raise ValueError(f"{context}: period must be >= 50 ms for animation {anim!r}")
+        raise ValueError(f"period for animation {anim!r} must be >= 50 ms")
     return int(period)
 
 
-def build_command_from_entry(entry, context: str) -> str:
-    if not isinstance(entry, dict):
-        raise ValueError(f"{context}: entry must be a JSON object")
-    anim = entry.get("animation")
+def _clamp8(v: int) -> int:
+    return max(0, min(255, int(v)))
+
+
+def _clamp_pct(v: int) -> int:
+    return max(0, min(100, int(v)))
+
+
+def build_wire_line(anim: str,
+                    rgb: tuple[int, int, int] | None = None,
+                    rgb2: tuple[int, int, int] | None = None,
+                    period: int | None = None,
+                    level: int | None = None,
+                    brightness: int = 100) -> str:
+    """Single source of truth for the firmware wire-line format.
+
+    Per-animation requirements:
+      off                                            → "off" (other args ignored)
+      solid    rgb                                   → "solid r g b [pct]"
+      level    rgb, level                            → "level r g b level [pct]"
+      strobe   rgb, rgb2, period                     → "strobe r g b r2 g2 b2 period [pct]"
+      breathe/blink/scanner/fill/converge
+               rgb, period                           → "<anim> r g b period [pct]"
+    """
     if anim not in ANIMATIONS:
-        raise ValueError(f"{context}: invalid animation {anim!r} (valid: {sorted(ANIMATIONS)})")
+        raise ValueError(f"invalid animation {anim!r} (valid: {sorted(ANIMATIONS)})")
     if anim == "off":
         return "off"
-    r, g, b = coerce_rgb_from_json(entry.get("rgb"), context)
-    pct = max(0, min(100, int(entry.get("brightness", 100))))
+    if rgb is None:
+        raise ValueError(f"rgb required for animation {anim!r}")
+    r, g, b = (_clamp8(rgb[0]), _clamp8(rgb[1]), _clamp8(rgb[2]))
+    pct = _clamp_pct(brightness)
     if anim == "solid":
         return f"solid {r} {g} {b} {pct}"
     if anim == "level":
-        level = entry.get("level")
-        if isinstance(level, bool) or not isinstance(level, (int, float)):
-            raise ValueError(f"{context}: level required for animation {anim!r} (0-100)")
-        level = max(0, min(100, int(level)))
-        return f"level {r} {g} {b} {level} {pct}"
+        if level is None:
+            raise ValueError(f"level required for animation {anim!r} (0-100)")
+        return f"level {r} {g} {b} {_clamp_pct(level)} {pct}"
     if anim == "strobe":
-        r2, g2, b2 = coerce_rgb_from_json(entry.get("rgb2"), context)
-        period = validate_period(entry.get("period"), anim, context)
-        return f"strobe {r} {g} {b} {r2} {g2} {b2} {period} {pct}"
-    period = validate_period(entry.get("period"), anim, context)
-    return f"{anim} {r} {g} {b} {period} {pct}"
+        if rgb2 is None:
+            raise ValueError(f"rgb2 required for animation {anim!r}")
+        r2, g2, b2 = (_clamp8(rgb2[0]), _clamp8(rgb2[1]), _clamp8(rgb2[2]))
+        return f"strobe {r} {g} {b} {r2} {g2} {b2} {validate_period(period, anim)} {pct}"
+    # breathe/blink/scanner/fill/converge
+    return f"{anim} {r} {g} {b} {validate_period(period, anim)} {pct}"
+
+
+def build_command_from_entry(entry, context: str) -> str:
+    """Validate a JSON profile entry and build its wire line.
+
+    Field extraction is per-animation (e.g., only `strobe` reads `rgb2`); the
+    actual wire-line formatting lives in build_wire_line.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError(f"{context}: entry must be a JSON object")
+    anim = entry.get("animation")
+    try:
+        return build_wire_line(
+            anim,
+            rgb=coerce_rgb_from_json(entry.get("rgb"), context) if anim != "off" else None,
+            rgb2=coerce_rgb_from_json(entry.get("rgb2"), context) if anim == "strobe" else None,
+            period=entry.get("period") if anim in PERIOD_ANIMATIONS else None,
+            level=entry.get("level") if anim == "level" else None,
+            brightness=entry.get("brightness", 100),
+        )
+    except ValueError as e:
+        raise ValueError(f"{context}: {e}")
 
 
 def resolve_state(state_ref: str) -> str:
+    """Resolve PROFILE.KEY → firmware wire line. Kept for compatibility."""
+    wire, _ = resolve_state_full(state_ref)
+    return wire
+
+
+def resolve_state_full(state_ref: str) -> tuple[str, int]:
+    """Resolve PROFILE.KEY → (wire_line, priority).
+
+    Priority comes from the entry's optional `priority` field; defaults to 0
+    (lowest). Priority is opaque to the daemon — it just means "higher number
+    wins" during multi-session aggregation.
+    """
     if "." not in state_ref:
         raise ValueError(f"--state expects PROFILE.KEY (e.g. claude.idle), got {state_ref!r}")
     profile_name, key = state_ref.split(".", 1)
@@ -185,34 +238,42 @@ def resolve_state(state_ref: str) -> str:
         raise ValueError(
             f"state {key!r} not in profile {profile_name!r} (valid: {sorted(public_keys)})"
         )
-    return build_command_from_entry(profile[key], context=state_ref)
+    entry = profile[key]
+    wire = build_command_from_entry(entry, context=state_ref)
+    priority = 0
+    if isinstance(entry, dict):
+        raw_priority = entry.get("priority", 0)
+        try:
+            priority = int(raw_priority)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{state_ref}: priority must be an integer, got {raw_priority!r}"
+            )
+    return wire, priority
+
+
+def build_state_line(sid: str, priority: int, wire: str) -> str:
+    """STATE <sid> <priority> <wire-line...> — set/update a session (aggregated)."""
+    return f"STATE {sid} {priority} {wire}"
+
+
+def build_clear_line(sid: str) -> str:
+    """CLEAR <sid> — remove a session from the aggregation map."""
+    return f"CLEAR {sid}"
+
+
+def build_transient_line(ttl_ms: int, wire: str) -> str:
+    """TRANSIENT <ttl_ms> <wire-line...> — one-shot override with TTL."""
+    return f"TRANSIENT {ttl_ms} {wire}"
 
 
 def build_raw_command(anim: str, rgb: tuple[int, int, int] | None,
                       period: int | None, pct: int,
                       rgb2: tuple[int, int, int] | None = None,
                       level: int | None = None) -> str:
-    if anim == "off":
-        return "off"
-    if rgb is None:
-        raise ValueError(f"--rgb required for animation {anim!r}")
-    r, g, b = rgb
-    pct = max(0, min(100, pct))
-    if anim == "solid":
-        return f"solid {r} {g} {b} {pct}"
-    if anim == "level":
-        if level is None:
-            raise ValueError(f"--level required for animation {anim!r} (0-100)")
-        level = max(0, min(100, level))
-        return f"level {r} {g} {b} {level} {pct}"
-    if anim == "strobe":
-        if rgb2 is None:
-            raise ValueError(f"--rgb2 required for animation {anim!r}")
-        r2, g2, b2 = rgb2
-        validated_period = validate_period(period, anim, "raw")
-        return f"strobe {r} {g} {b} {r2} {g2} {b2} {validated_period} {pct}"
-    validated_period = validate_period(period, anim, "raw")
-    return f"{anim} {r} {g} {b} {validated_period} {pct}"
+    """Build a wire line from raw CLI args. Thin wrapper around build_wire_line."""
+    return build_wire_line(anim, rgb=rgb, rgb2=rgb2, period=period,
+                           level=level, brightness=pct)
 
 
 def send_command(cmd: str, port: str | None, quiet: bool = False) -> bool:
@@ -285,35 +346,82 @@ def main():
     parser.add_argument("--port", default=None,
                         help="Serial port path (e.g. /dev/cu.usbserial-1410)")
     parser.add_argument("--direct", action="store_true",
-                        help="Bypass the daemon and talk to the serial port directly (debug)")
+                        help="Bypass the daemon and talk to the serial port directly (debug; ignores --session/--ttl)")
     parser.add_argument("--quiet", action="store_true",
                         help="Stay silent if the LED is missing or fails (do not interrupt Claude Code)")
+    parser.add_argument("--session", default=None, metavar="SID",
+                        help="Track this invocation as part of a session (aggregated). "
+                             "Defaults to $CLAUDE_SESSION_ID if set. With a session, the "
+                             "command is sent as STATE and competes by priority with other "
+                             "live sessions.")
+    parser.add_argument("--end-session", default=None, metavar="SID",
+                        help="Remove a session from the daemon's aggregation map (SessionEnd). "
+                             "Defaults to $CLAUDE_SESSION_ID if set.")
+    parser.add_argument("--ttl", type=int, default=None, metavar="MS",
+                        help="Transient override TTL in ms (default 3000 or "
+                             "$CLAUDE_LED_TRANSIENT_TTL_MS). Only applies when no --session "
+                             "is in effect; the resolved state flashes briefly then reverts to "
+                             "the aggregate.")
     args = parser.parse_args()
 
     if (args.raw or args.state) and args.key:
         parser.error("positional <key> cannot be combined with --raw or --state")
-    if not (args.raw or args.state or args.key):
-        parser.error("expected one of: --raw ANIM, --state PROFILE.KEY, or positional <key>")
+    if args.end_session is not None and args.session is not None:
+        parser.error("--end-session and --session are mutually exclusive")
+    if args.end_session is not None and (args.raw or args.state or args.key):
+        parser.error("--end-session cannot be combined with --state, --raw, or positional <key>")
+    if not (args.raw or args.state or args.key or args.end_session is not None):
+        parser.error("expected one of: --raw ANIM, --state PROFILE.KEY, positional <key>, or --end-session SID")
 
     try:
+        # CLEAR mode: --end-session removes a session from the daemon's map.
+        if args.end_session is not None:
+            sid = args.end_session or os.environ.get("CLAUDE_SESSION_ID") or ""
+            if not sid:
+                if not args.quiet:
+                    print("--end-session requires a session ID (pass one explicitly "
+                          "or run under Claude Code with $CLAUDE_SESSION_ID set)",
+                          file=sys.stderr)
+                sys.exit(0)
+            if args.direct:
+                if not args.quiet:
+                    print("--direct ignores --end-session (no daemon to clear from)",
+                          file=sys.stderr)
+                sys.exit(0)
+            send_via_daemon(build_clear_line(sid), quiet=args.quiet)
+            sys.exit(0)
+
+        # Resolve wire line (and priority if from a profile)
         if args.raw:
             if args.raw not in ANIMATIONS:
                 raise ValueError(f"unknown animation {args.raw!r} (valid: {sorted(ANIMATIONS)})")
             rgb = parse_rgb(args.rgb) if args.rgb is not None else None
             rgb2 = parse_rgb(args.rgb2) if args.rgb2 is not None else None
-            cmd = build_raw_command(args.raw, rgb, args.period, args.brightness,
-                                    rgb2=rgb2, level=args.level)
+            wire = build_raw_command(args.raw, rgb, args.period, args.brightness,
+                                     rgb2=rgb2, level=args.level)
+            priority = 0  # raw mode bypasses profile lookup; no priority
         else:
-            cmd = resolve_state(args.state or f"default.{args.key}")
+            wire, priority = resolve_state_full(args.state or f"default.{args.key}")
+
+        # Direct serial debug path — bypasses daemon and aggregation entirely.
+        if args.direct:
+            send_command(wire, args.port, quiet=args.quiet)
+            sys.exit(0)
+
+        # Daemon path: pick STATE (aggregated) vs TRANSIENT (TTL flash) by
+        # whether a session id is in play.
+        session_id = args.session or os.environ.get("CLAUDE_SESSION_ID")
+        if session_id:
+            send_via_daemon(build_state_line(session_id, priority, wire),
+                            quiet=args.quiet)
+        else:
+            ttl_ms = (args.ttl if args.ttl is not None
+                      else int(os.environ.get("CLAUDE_LED_TRANSIENT_TTL_MS",
+                                              DEFAULT_TRANSIENT_TTL_MS)))
+            send_via_daemon(build_transient_line(ttl_ms, wire), quiet=args.quiet)
     except ValueError as e:
         if not args.quiet:
             print(f"Error: {e}", file=sys.stderr)
-        sys.exit(0)
-
-    if args.direct:
-        send_command(cmd, args.port, quiet=args.quiet)
-    else:
-        send_via_daemon(cmd, quiet=args.quiet)
     sys.exit(0)
 
 
