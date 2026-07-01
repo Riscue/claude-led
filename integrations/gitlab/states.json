@@ -1,5 +1,5 @@
 {
-  "_comment": "GitLab pipeline state → animation. Edit freely. Copy to ~/.claude-led/states/gitlab.json after install.",
+  "_comment": "GitLab pipeline state → animation. Edit freely; install.sh mirrors this folder to ~/.claude-led/integrations/gitlab/.",
   "pending": {
     "animation": "breathe",
     "rgb": [200, 200, 200],

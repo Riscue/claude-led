@@ -8,7 +8,7 @@ terminals aggregate by priority — one's `error` (100) overrides another's
 ## Setup
 
 After `./scripts/install.sh install`, the files in this directory are
-mirrored to `~/.claude-led/hooks/claude/`:
+mirrored to `~/.claude-led/integrations/claude/`:
 
 - `led-hook.sh` — reads the hook JSON payload from stdin, extracts
   `session_id` via `jq`, fires `led --session <id> --state claude.<key>`.
@@ -28,7 +28,7 @@ mirrored to `~/.claude-led/hooks/claude/`:
    | `Stop`                 | `claude.success`  | green fill        |
    | `SessionEnd`           | (session cleared) | —                 |
 
-2. Customize colors/priorities in `~/.claude-led/states/claude.json`.
+2. Customize colors/priorities in `~/.claude-led/integrations/claude/states.json`.
 
 ## Requirements
 
@@ -39,9 +39,9 @@ missing; install with `brew install jq` (macOS) or `apt install jq` (Linux).
 
 ## Customizing
 
-- **Different colors / speed / brightness per state** — edit `claude.json`.
+- **Different colors / speed / brightness per state** — edit `states.json`.
   No code changes needed.
-- **New state** (e.g. `warning`) — add a key to `claude.json` *and* a hook
+- **New state** (e.g. `warning`) — add a key to `states.json` *and* a hook
   entry that fires `led-hook.sh warning`. The two must stay in sync.
 - **Skip a state** — delete the entry from `settings.json`. The matching
-  `claude.json` key becomes unused but harmless.
+  `states.json` key becomes unused but harmless.

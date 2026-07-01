@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Usage: led-hook.sh <state>
 # Reads Claude Code hook JSON from stdin, extracts session_id, calls `led`.
-# <state> is a bare key in driver/states/claude.json (idle, thinking, tool, ...);
+# <state> is a bare key in integrations/claude/states.json (idle, thinking, tool, ...);
 # the "claude." profile prefix is added here. Pass "end" for SessionEnd to
 # trigger --end-session instead.
 

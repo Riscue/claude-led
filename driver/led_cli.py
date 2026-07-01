@@ -16,11 +16,14 @@ The daemon is mandatory. If it is not running, the command is dropped (the
 LED is not updated) — there is no automatic direct-serial fallback. Use
 --direct to bypass the daemon for debug; it is not intended for hook use.
 
-State mappings live as JSON profiles in driver/states/. Each profile is a flat
-dict of {state_name: {animation, rgb, period, brightness, [priority]}}. Use
---state <profile>.<key> to load one. Add new profiles (git.json, slack.json,
-...) by dropping new JSON files in driver/states/ -- no Python changes
-required.
+State mappings live in two places:
+  - BUILTIN_PROFILES (below)   hardcoded profiles; only `default` lives here
+  - integrations/<name>/states.json   per-integration profiles (claude, gitlab, ...)
+
+Each profile is a flat dict of {state_name: {animation, rgb, period,
+brightness, [priority]}}. Use --state <profile>.<key> to load one. Add a new
+integration by dropping a folder in integrations/<name>/ with its states.json
++ caller script — no Python changes required.
 
 Modes (daemon path):
     --session <sid>      STATE       aggregated; competes by priority with other
@@ -82,6 +85,17 @@ PERIOD_ANIMATIONS = {"breathe", "blink", "scanner", "fill", "converge", "strobe"
 DAEMON_SOCKET_TIMEOUT = 0.3
 DEFAULT_TRANSIENT_TTL_MS = 3000
 
+# Hardcoded profiles — always available, no JSON lookup. Only `default` lives
+# here; everything else ships as integrations/<name>/states.json. `led <key>`
+# (bare positional) is shorthand for `led --state default.<key>`.
+BUILTIN_PROFILES: dict[str, dict] = {
+    "default": {
+        "on": {"animation": "converge", "rgb": [0, 50, 220],
+               "period": 2000, "brightness": 100},
+        "off": {"animation": "off"},
+    },
+}
+
 
 def parse_rgb(s: str) -> tuple[int, int, int]:
     """Accept 'r,g,b' (e.g. '0,50,220') or a single value for grayscale."""
@@ -100,20 +114,35 @@ def parse_rgb(s: str) -> tuple[int, int, int]:
     raise ValueError(f"--rgb expects 1 or 3 values, got {len(nums)}")
 
 
-def states_dir() -> str:
-    """Directory containing JSON state profiles. Override with CLAUDE_LED_STATES_DIR."""
-    override = os.environ.get("CLAUDE_LED_STATES_DIR")
+def integrations_dir() -> str:
+    """Directory containing per-integration profiles (integrations/<name>/states.json).
+
+    Override with CLAUDE_LED_INTEGRATIONS_DIR. In the installed layout this is
+    a sibling of led_cli.py (~/.claude-led/integrations/). In the repo layout
+    it sits one level up (repo-root/integrations/).
+    """
+    override = os.environ.get("CLAUDE_LED_INTEGRATIONS_DIR")
     if override:
         return override
-    # realpath so that when invoked through a symlink (e.g. ~/.local/bin/led
-    # -> ~/.claude-led/led_cli.py) we find the states next to the real file.
-    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "states")
+    here = os.path.dirname(os.path.realpath(__file__))
+    installed = os.path.join(here, "integrations")
+    if os.path.isdir(installed):
+        return installed
+    return os.path.join(here, "..", "integrations")
 
 
 def load_profile(profile_name: str) -> dict:
-    path = os.path.join(states_dir(), f"{profile_name}.json")
+    """Load a state profile by name.
+
+    Order: BUILTIN_PROFILES first, then integrations/<name>/states.json.
+    """
+    if profile_name in BUILTIN_PROFILES:
+        return BUILTIN_PROFILES[profile_name]
+    path = os.path.join(integrations_dir(), profile_name, "states.json")
     if not os.path.exists(path):
-        raise ValueError(f"profile not found: {profile_name!r} (looked at {path})")
+        raise ValueError(
+            f"profile not found: {profile_name!r} (looked at {path})"
+        )
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -331,7 +360,7 @@ def main():
     mode.add_argument("--raw", metavar="ANIM",
                       help="Send a raw animation: solid/breathe/blink/scanner/fill/strobe/level/converge/off")
     mode.add_argument("--state", metavar="PROFILE.KEY",
-                      help="Look up a state in driver/states/<PROFILE>.json (e.g. claude.idle)")
+                      help="Look up a state in integrations/<PROFILE>/states.json, or a built-in profile (default) (e.g. claude.idle)")
     parser.add_argument("key", nargs="?", default=None,
                         help="Shorthand for --state default.<key> (e.g. `led off`)")
     parser.add_argument("--rgb", default=None,

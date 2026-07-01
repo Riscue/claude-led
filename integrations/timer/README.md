@@ -4,8 +4,8 @@ Count-up or countdown timer rendered as a `level` bar. Green while there's
 plenty of time left, fading to red as the deadline nears. A cyan ↔ magenta
 strobe plays for 3 s when the run finishes.
 
-Unlike `claude/` and `gitlab/`, this example ships **no JSON profile** — it
-fires `led --raw level` directly, the right pattern when parameters are
+Unlike `claude/` and `gitlab/`, this integration ships **no JSON profile** —
+it fires `led --raw level` directly, the right pattern when parameters are
 computed on the fly (here: a percentage and an RGB gradient interpolated in
 bash).
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# examples/timer/run.sh — LED strip timer (count-up or countdown).
+# integrations/timer/run.sh — LED strip timer (count-up or countdown).
 #
 # Usage:
 #   ./run.sh <duration>                # count up: 0 → <duration>  (default)

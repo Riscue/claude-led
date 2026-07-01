@@ -47,7 +47,8 @@ Aggregation:
 
     The daemon treats both <sid> and <priority> as opaque — it does not know
     which state name a priority corresponds to. The state → priority mapping
-    lives entirely in driver/states/<profile>.json and is resolved by led_cli.py
+    lives in JSON profiles (integrations/<profile>/states.json) or in the
+    CLI's hardcoded BUILTIN_PROFILES (`default`) and is resolved by led_cli.py
     before commands reach the daemon.
 
 Started at login by scripts/install.sh (via launchd on macOS, systemd --user on

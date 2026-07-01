@@ -6,7 +6,7 @@ single strip by priority.
 
 The daemon, CLI, and firmware are **integration-agnostic**. There is no Claude-specific or GitLab-specific code
 anywhere. Every integration is just a JSON state profile + a caller that fires `led`. Add a new source by dropping a
-JSON file into `~/.claude-led/states/` — no Python edits, no reflash, no daemon restart.
+folder into `integrations/` — no Python edits, no reflash, no daemon restart.
 
 ## Quick start
 
@@ -16,7 +16,7 @@ pip3 install pyserial                     # one-time dependency
 led --state claude.idle                   # verify: strip breathes blue
 ```
 
-Then wire Claude Code to fire `led` on each hook (see [`examples/claude/`](examples/claude/README.md)). The strip now
+Then wire Claude Code to fire `led` on each hook (see [`integrations/claude/`](integrations/claude/README.md)). The strip now
 mirrors Claude's state, and multiple parallel sessions aggregate by priority.
 
 ## What it does
@@ -69,25 +69,26 @@ To remove: `./scripts/install.sh uninstall`. **No sudo required** — entirely u
 
 ## How integrations plug in
 
-Every integration is two things:
+Every integration is two things, colocated in one folder under `integrations/<source>/`:
 
-1. **A JSON state profile** at `~/.claude-led/states/<source>.json` — maps state keys to (animation, color, period,
+1. **A JSON state profile** (`integrations/<source>/states.json`) — maps state keys to (animation, color, period,
    brightness, priority)
-2. **A caller** that invokes `led --session <id> --state <source>.<key>` when something happens
+2. **A caller** (script, hook config, or poller) that invokes `led --session <id> --state <source>.<key>` when something happens
 
-That's it. The CLI loads the profile by name, the daemon treats `<sid>` and `<priority>` as opaque numbers, and the
-firmware just renders whatever animation arrives.
+That's it. The CLI finds the profile by name (it looks in `integrations/<source>/states.json`, with `default.on` /
+`default.off` hardcoded as builtins), the daemon treats `<sid>` and `<priority>` as opaque numbers, and the firmware
+just renders whatever animation arrives.
 
-Reference integrations live in [`examples/`](examples/):
+Reference integrations live in [`integrations/`](integrations/):
 
-| Integration                                     | What it shows                                | Files                                        |
-|-------------------------------------------------|----------------------------------------------|----------------------------------------------|
-| [`examples/claude/`](examples/claude/README.md) | Claude Code session state via hooks          | `led-hook.sh`, `settings_hooks_example.json` |
-| [`examples/gitlab/`](examples/gitlab/README.md) | GitLab pipeline status via API poller        | `poller.py`, `states-gitlab.json`            |
-| [`examples/timer/`](examples/timer/run.sh)      | Count-up / countdown timer via `--raw level` | `run.sh`                                     |
+| Integration                                             | What it shows                                | Files                                        |
+|---------------------------------------------------------|----------------------------------------------|----------------------------------------------|
+| [`integrations/claude/`](integrations/claude/README.md) | Claude Code session state via hooks          | `led-hook.sh`, `settings_hooks_example.json` |
+| [`integrations/gitlab/`](integrations/gitlab/README.md) | GitLab pipeline status via API poller        | `poller.py`, `states.json`                   |
+| [`integrations/timer/`](integrations/timer/run.sh)      | Count-up / countdown timer via `--raw level` | `run.sh`                                     |
 
-Drop a new `examples/foo/` directory in and `install.sh` mirrors it to `~/.claude-led/hooks/foo/` automatically — no
-install-script changes required.
+Drop a new `integrations/foo/` directory in and `install.sh` mirrors it to `~/.claude-led/integrations/foo/`
+automatically — no install-script changes required.
 
 ## State profile reference
 
@@ -189,10 +190,10 @@ daemon restart drops all in-memory state — sessions rebuild as callers fire ag
 ├── led_cli.py             # CLI (called by hooks / pollers / scripts)
 ├── led_daemon.py          # daemon (stateful aggregator)
 ├── protocol.py            # shared constants
-├── states/                # JSON profiles (claude.json, default.json, drop your own here)
-├── hooks/                 # caller-side glue mirrored from examples/
-│   ├── claude/            # led-hook.sh, settings_hooks_example.json, README.md
-│   └── gitlab/            # poller.py, states-gitlab.json, README.md
+├── integrations/          # one folder per integration, mirrored from repo's integrations/
+│   ├── claude/            # led-hook.sh, settings_hooks_example.json, states.json, README.md
+│   ├── gitlab/            # poller.py, states.json, README.md
+│   └── timer/             # run.sh, README.md
 ├── led.sock               # Unix socket (runtime)
 ├── daemon.pid             # PID (runtime)
 └── daemon.log             # logs (runtime)
@@ -202,6 +203,9 @@ daemon restart drops all in-memory state — sessions rebuild as callers fire ag
 ~/Library/LaunchAgents/tr.riscue.claude-led.plist       # macOS (auto-start)
 ~/.config/systemd/user/tr.riscue.claude-led.service     # Linux (auto-start)
 ```
+
+The CLI also ships a hardcoded `default` profile (used by the bare `led on` / `led off` shorthand) — it lives in
+`BUILTIN_PROFILES` inside `led_cli.py`, not on disk.
 
 Daemon log: `~/.claude-led/daemon.log` — watch with `tail -f`.
 
@@ -317,6 +321,7 @@ Useful environment variables during development:
 
 - `CLAUDE_LED_LOG_LEVEL=DEBUG` — daemon logs every received command
 - `CLAUDE_LED_PORT=/dev/...` — override serial-port auto-detection
+- `CLAUDE_LED_INTEGRATIONS_DIR` — override the integration profile search path
 
 ## Tests
 

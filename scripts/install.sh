@@ -2,8 +2,8 @@
 # install.sh — install / uninstall the claude-led daemon (user-level, no sudo).
 #
 # Layout after install:
-#   ~/.claude-led/{led_cli.py, led_daemon.py, protocol.py, states/*.json}
-#   ~/.claude-led/hooks/<source>/    (caller-side glue mirrored from examples/)
+#   ~/.claude-led/{led_cli.py, led_daemon.py, protocol.py}
+#   ~/.claude-led/integrations/<source>/    (each integration's glue + states.json, mirrored from integrations/)
 #   ~/.claude-led/{led.sock, daemon.pid, daemon.log}   (runtime, by daemon)
 #   ~/.local/bin/led                                   (symlink → led_cli.py)
 #   ~/Library/LaunchAgents/tr.riscue.claude-led.plist       (macOS, auto-start)
@@ -26,8 +26,8 @@ SYSTEMD_UNIT="$HOME/.config/systemd/user/$LABEL.service"
 # Repo paths — install.sh runs from scripts/, so siblings live one level up.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$SCRIPT_DIR/../driver"
-EXAMPLES_DIR="$SCRIPT_DIR/../examples"
-HOOK_DST_DIR="$INSTALL_DIR/hooks"
+INTEGRATIONS_DIR="$SCRIPT_DIR/../integrations"
+INTEGRATIONS_DST_DIR="$INSTALL_DIR/integrations"
 
 detect_platform() {
   case "$(uname -s)" in
@@ -111,11 +111,8 @@ cmd_install() {
     exit 1
   }
 
-  [[ -f "$SRC_DIR/states/claude.json" ]] || {
-    echo "no state JSON files found in $SRC_DIR/states/" >&2; exit 1
-  }
-  [[ -d "$EXAMPLES_DIR" ]] || {
-    echo "examples directory not found: $EXAMPLES_DIR" >&2; exit 1
+  [[ -d "$INTEGRATIONS_DIR" ]] || {
+    echo "integrations directory not found: $INTEGRATIONS_DIR" >&2; exit 1
   }
 
   local log_level="${CLAUDE_LED_LOG_LEVEL:-INFO}"
@@ -126,31 +123,31 @@ cmd_install() {
   echo "    log level:   $log_level"
   echo ""
 
-  # 1. Copy driver files
-  mkdir -p "$INSTALL_DIR/states"
+  # 1. Copy driver files (no states/ dir — the only built-in profile, `default`,
+  #    is hardcoded in led_cli.py; per-integration profiles ship inside their
+  #    integrations/<name>/ folder).
   cp "$SRC_DIR/led_cli.py"     "$INSTALL_DIR/"
   cp "$SRC_DIR/led_daemon.py"  "$INSTALL_DIR/"
   cp "$SRC_DIR/protocol.py"    "$INSTALL_DIR/"
-  cp "$SRC_DIR/states/"*.json  "$INSTALL_DIR/states/"
   chmod 755 "$INSTALL_DIR"/{led_cli.py,led_daemon.py,protocol.py}
-  chmod 644 "$INSTALL_DIR"/states/*.json
-  echo "    copied: led_cli.py, led_daemon.py, protocol.py, states/"
+  echo "    copied: led_cli.py, led_daemon.py, protocol.py"
 
-  # 2. Mirror every examples/<source>/ → hooks/<source>/. Each subdirectory is
-  #    one integration's caller-side glue (scripts, ready-to-paste configs).
-  #    Adding a new integration (examples/foo/) needs no changes here.
-  mkdir -p "$HOOK_DST_DIR"
-  local example_src name
+  # 2. Mirror every integrations/<source>/ → integrations/<source>/. Each
+  #    subdirectory is one integration's self-contained bundle (caller script,
+  #    states.json, README). Adding a new integration (integrations/foo/) needs
+  #    no changes here.
+  mkdir -p "$INTEGRATIONS_DST_DIR"
+  local integration_src name
   shopt -s nullglob
-  for example_src in "$EXAMPLES_DIR"/*/; do
-    name="$(basename "$example_src")"
-    rm -rf "$HOOK_DST_DIR/$name"
-    cp -r "${example_src%/}" "$HOOK_DST_DIR/"
+  for integration_src in "$INTEGRATIONS_DIR"/*/; do
+    name="$(basename "$integration_src")"
+    rm -rf "$INTEGRATIONS_DST_DIR/$name"
+    cp -r "${integration_src%/}" "$INTEGRATIONS_DST_DIR/"
     # scripts +x so they can be invoked directly from settings.json;
-    # JSON example configs stay 644.
-    find "$HOOK_DST_DIR/$name" -name '*.sh'   -exec chmod 755 {} +
-    find "$HOOK_DST_DIR/$name" -name '*.json' -exec chmod 644 {} +
-    echo "    copied: hooks/$name/"
+    # JSON files stay 644.
+    find "$INTEGRATIONS_DST_DIR/$name" -name '*.sh'   -exec chmod 755 {} +
+    find "$INTEGRATIONS_DST_DIR/$name" -name '*.json' -exec chmod 644 {} +
+    echo "    copied: integrations/$name/"
   done
   shopt -u nullglob
 
@@ -163,7 +160,7 @@ cmd_install() {
   # lives in a private dir.
   chmod 700 "$INSTALL_DIR" 2>/dev/null || true
 
-  # 5. Warn if BIN_DIR is not on PATH (hooks call `led` and need it findable)
+  # 5. Warn if BIN_DIR is not on PATH (integration scripts call `led`)
   case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *)
@@ -174,9 +171,9 @@ cmd_install() {
       ;;
   esac
 
-  # 6. jq is required by hooks/claude/led-hook.sh; warn only when that
+  # 6. jq is required by integrations/claude/led-hook.sh; warn only when that
   #    integration was installed.
-  [[ -d "$HOOK_DST_DIR/claude" ]] && ensure_jq
+  [[ -d "$INTEGRATIONS_DST_DIR/claude" ]] && ensure_jq
 
   # 7. Write + load auto-start unit
   case "$platform" in
@@ -314,8 +311,8 @@ Auto-start:
   Linux:  $SYSTEMD_UNIT
 
 Files installed:
-  $INSTALL_DIR/{{led_cli,led_daemon,protocol}.py, states/*.json}
-  $INSTALL_DIR/hooks/<source>/    (mirrored from examples/)
+  $INSTALL_DIR/{led_cli,led_daemon,protocol}.py
+  $INSTALL_DIR/integrations/<source>/    (mirrored from integrations/)
   $LED_SYMLINK → $INSTALL_DIR/led_cli.py
 EOF
 }
