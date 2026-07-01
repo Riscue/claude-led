@@ -400,7 +400,8 @@ def main():
             rgb2 = parse_rgb(args.rgb2) if args.rgb2 is not None else None
             wire = build_raw_command(args.raw, rgb, args.period, args.brightness,
                                      rgb2=rgb2, level=args.level)
-            priority = 0  # raw mode bypasses profile lookup; no priority
+            # raw mode = manual invocation; outrank every Claude Code session state
+            priority = 100
         else:
             wire, priority = resolve_state_full(args.state or f"default.{args.key}")
 
