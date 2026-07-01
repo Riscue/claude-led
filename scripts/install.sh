@@ -126,6 +126,7 @@ cmd_install() {
   # 1. Copy driver files (no states/ dir — the only built-in profile, `default`,
   #    is hardcoded in led_cli.py; per-integration profiles ship inside their
   #    integrations/<name>/ folder).
+  mkdir -p "$INSTALL_DIR"
   cp "$SRC_DIR/led_cli.py"     "$INSTALL_DIR/"
   cp "$SRC_DIR/led_daemon.py"  "$INSTALL_DIR/"
   cp "$SRC_DIR/protocol.py"    "$INSTALL_DIR/"
