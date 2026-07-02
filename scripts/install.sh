@@ -248,8 +248,12 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=default.target
 EOF
   systemctl --user daemon-reload
-  systemctl --user enable --now "$LABEL.service"
-  echo "    auto-start: $SYSTEMD_UNIT (systemd --user, enable --now + Restart=on-failure)"
+  systemctl --user enable "$LABEL.service"
+  # `enable --now` alone doesn't restart an already-running unit, which leaves
+  # the in-memory process running stale code after an upgrade. Restart picks
+  # up the new files whether the unit was active or not.
+  systemctl --user restart "$LABEL.service"
+  echo "    auto-start: $SYSTEMD_UNIT (systemd --user, enable + restart, Restart=on-failure)"
   if ! loginctl show-user "$USER" 2>/dev/null | grep -q '^Linger=yes'; then
     echo ""
     echo "    NOTE: run 'loginctl enable-linger $USER' so the daemon starts at boot"
