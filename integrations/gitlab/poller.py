@@ -2,30 +2,42 @@
 """
 GitLab pipeline poller for status-led.
 
-Polls GitLab's pipelines API and mirrors each active pipeline's status onto
-the LED strip. Each pipeline becomes a session (`gitlab-<id>`) so concurrent
-pipelines aggregate by priority — a failed pipeline (priority 90) overrides
-Claude thinking (60), etc.
+Polls GitLab's pipelines API and mirrors each pipeline's status onto the LED
+strip. Each pipeline becomes a session (`gitlab-<id>`) so concurrent pipelines
+aggregate by priority — a failed pipeline (priority 90) overrides Claude
+thinking (60), etc.
+
+Behaviour: while any watched pipeline is in-flight, keep polling at --interval.
+Once everything goes idle, hold the final state briefly so the outcome is
+visible, then CLEAR every session this script created and exit.
+
+For always-on monitoring, run under systemd with Restart=always + RestartSec,
+or wrap in a shell loop: `while true; do ./poller.py; sleep 30; done`.
 
 Requires: pip3 install requests
 
 Usage:
-    # one-shot (cron mode)
     GITLAB_URL=https://gitlab.com \\
     GITLAB_TOKEN=<token-with-read_api> \\
     PROJECTS=myteam/backend,myteam/frontend \\
-    ./poller.py --once
+    ./poller.py
 
-    # continuous poll every 15s (default)
-    ./poller.py --interval 15
+    # with an env file (recommended — keeps credentials out of shell history):
+    cp .env.example .env  # then edit
+    ./poller.py           # .env auto-loaded if present in cwd
 
 Environment:
     GITLAB_URL     base URL (no trailing slash)
     GITLAB_TOKEN   personal access token with read_api scope
     PROJECTS       comma-separated project paths
 
-Sessions are cleared automatically once GitLab no longer reports them as
-active — no stale entries linger on the strip.
+--env-file PATH: load KEY=VALUE lines from a file. Defaults to ./.env; a
+    missing default is silently skipped, a missing explicit path is an error.
+    File values override the environment. Comments (#) and blank lines are
+    ignored. Matching surrounding quotes are stripped ("key" → key).
+
+Sessions created during a run are CLEARed on exit (clean, Ctrl-C, or idle), so
+no stale entries linger on the strip between invocations.
 """
 
 from __future__ import annotations
@@ -43,7 +55,12 @@ except ImportError:
     sys.exit(1)
 
 
-ACTIVE_STATUSES = ("pending", "running", "success", "failed")
+ACTIVE_STATUSES = ("pending", "running")
+
+# Seconds to hold the final state on a clean exit before clearing, so the user
+# actually sees the outcome (fill animation period is ~3 s; shorter than this
+# and the fill wouldn't complete before the strip goes dark).
+FINAL_HOLD_SECONDS = 3
 
 
 def env_required(name: str) -> str:
@@ -54,6 +71,46 @@ def env_required(name: str) -> str:
     return value
 
 
+def load_env_file(path: str, required: bool) -> None:
+    """Load KEY=VALUE lines from a file into os.environ. File values override
+    the environment. Format:
+      - One KEY=VALUE per line; split on first '='
+      - Blank lines and lines starting with '#' ignored
+      - Matching surrounding quotes stripped ("key" / 'key' → key)
+      - No shell expansion, no interpolation
+
+    If `required` is False, a missing file is silently skipped (the .env
+    default convention). If True, a missing file is an error.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        if required:
+            print(f"error: --env-file {path} not found", file=sys.stderr)
+            sys.exit(2)
+        return
+    except OSError as e:
+        print(f"error: could not read --env-file {path}: {e}", file=sys.stderr)
+        sys.exit(2)
+    for lineno, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            print(f"warning: {path}:{lineno}: missing '=', skipping line", file=sys.stderr)
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        if not key:
+            print(f"warning: {path}:{lineno}: empty key, skipping line", file=sys.stderr)
+            continue
+        os.environ[key] = value
+
+
 def fire_led(args: list[str]) -> None:
     """Invoke `led` quietly; never raise — one bad call must not kill the loop."""
     try:
@@ -62,59 +119,94 @@ def fire_led(args: list[str]) -> None:
         print("`led` not on PATH; run ./scripts/install.sh install first", file=sys.stderr)
 
 
+def clear_sessions(seen: set[str]) -> None:
+    """CLEAR every session we created so the LED doesn't stay stuck on the
+    last animation after the script exits."""
+    for sid in seen:
+        fire_led(["--end-session", sid])
+
+
 def fetch_pipelines(gitlab: str, token: str, project: str) -> list[dict]:
     url = f"{gitlab}/api/v4/projects/{project.replace('/', '%2F')}/pipelines"
-    resp = requests.get(url, params={"per_page": 50, "sort": "desc"},
+    # per_page=1: we only ever care about the most recent pipeline — active
+    # or not, that's the single one we'll show.
+    resp = requests.get(url, params={"per_page": 1, "sort": "desc"},
                         headers={"PRIVATE-TOKEN": token}, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
 
-def poll_once(gitlab: str, token: str, projects: list[str], seen: set[str]) -> set[str]:
-    """Fire one STATE per active pipeline; clear any session that's gone away.
+def poll(gitlab: str, token: str, projects: list[str], seen: set[str]) -> tuple[set[str], bool]:
+    """For each project: if any pipeline is currently active, STATE only those;
+    otherwise STATE only the single most recent pipeline (whatever its status).
 
-    Returns the new `seen` set to thread into the next call.
+    CLEARs any session that was previously STATE'd but is no longer current.
+
+    Returns (new_seen, has_active) where has_active is True if any project had
+    an in-flight pipeline — the caller uses this to decide whether to keep
+    watching or exit.
     """
     current: set[str] = set()
+    has_active = False
     for project in projects:
         try:
             pipelines = fetch_pipelines(gitlab, token, project)
         except (requests.RequestException, ValueError) as e:
             print(f"fetch failed for {project}: {e}", file=sys.stderr)
             continue
-        for pipe in pipelines:
-            status = pipe.get("status")
-            if status not in ACTIVE_STATUSES:
-                continue
-            sid = f"gitlab-{pipe['id']}"
+        active = [p for p in pipelines if p.get("status") in ACTIVE_STATUSES]
+        if active:
+            has_active = True
+            to_show = active
+        else:
+            to_show = pipelines[:1]
+        for pipeline in to_show:
+            sid = f"gitlab-{pipeline['id']}"
             current.add(sid)
-            fire_led(["--session", sid, "--state", f"gitlab.{status}"])
+            fire_led(["--session", sid, "--state", f"gitlab.{pipeline['status']}"])
     for stale in seen - current:
         fire_led(["--end-session", stale])
-    return current
+    return current, has_active
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="GitLab pipeline → LED poller")
-    parser.add_argument("--once", action="store_true",
-                        help="poll once and exit (cron mode)")
     parser.add_argument("--interval", type=int, default=15,
-                        help="poll interval in seconds (loop mode, default 15)")
+                        help="poll interval in seconds while active (default 15)")
+    parser.add_argument("--env-file", default=".env", metavar="PATH",
+                        help="KEY=VALUE file loaded before reading env vars "
+                             "(default: ./.env; missing default is silent, "
+                             "missing explicit path is an error)")
     args = parser.parse_args()
+
+    load_env_file(args.env_file, required=args.env_file != ".env")
 
     gitlab = env_required("GITLAB_URL").rstrip("/")
     token = env_required("GITLAB_TOKEN")
     projects = [p.strip() for p in env_required("PROJECTS").split(",") if p.strip()]
 
-    if args.once:
-        poll_once(gitlab, token, projects, set())
-        return
-
-    print(f"polling every {args.interval}s; projects: {projects}", file=sys.stderr)
+    print(f"watching projects: {projects}", file=sys.stderr)
     seen: set[str] = set()
-    while True:
-        seen = poll_once(gitlab, token, projects, seen)
-        time.sleep(args.interval)
+    interrupted = False
+    try:
+        while True:
+            seen, has_active = poll(gitlab, token, projects, seen)
+            if not has_active:
+                break
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        if seen:
+            # Hold the final state long enough for the fill animation to
+            # complete; skip on Ctrl-C since the user wants out now. A second
+            # Ctrl-C during the hold should not skip the CLEAR below.
+            if not interrupted:
+                try:
+                    time.sleep(FINAL_HOLD_SECONDS)
+                except KeyboardInterrupt:
+                    pass
+            clear_sessions(seen)
 
 
 if __name__ == "__main__":

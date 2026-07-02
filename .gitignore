@@ -25,3 +25,6 @@ build/
 # 3D printing intermediates (STL sources are kept; G-code is machine-specific)
 *.gcode
 *.gco
+
+# Local integration env files (auto-loaded .env files; .env.example is checked in)
+.env
